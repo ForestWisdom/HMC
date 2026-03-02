@@ -296,18 +296,33 @@ int main(int argc, char *argv[]) {
   else
     recv_func = recv_channel_slice_uhm;
 
-  for (int power = 5; power <= 26; ++power) {
+  int min_power = static_cast<int>(get_env_u32_or_default("MIN_POWER", 5));
+  int max_power = static_cast<int>(get_env_u32_or_default(
+      "MAX_POWER", (mode == "write" || mode == "pipeline") ? 29 : 26));
+  if (min_power < 1) min_power = 1;
+  if (max_power < min_power) max_power = min_power;
+
+  for (int power = min_power; power <= max_power; ++power) {
     size_t total_size = size_t(1) << power;
-    std::vector<uint8_t> host_data(total_size, 0);
+    size_t check_size = (mode == "pipeline" || mode == "write")
+                            ? std::min(total_size, buffer_size)
+                            : total_size;
+    std::vector<uint8_t> host_data(check_size, 0);
 
     void *gpu_ptr = nullptr;
-    gpu_mem_op->allocateBuffer(&gpu_ptr, total_size);
+    if (mode != "pipeline" && mode != "write") {
+      if (gpu_mem_op->allocateBuffer(&gpu_ptr, total_size) != status_t::SUCCESS ||
+          !gpu_ptr) {
+        std::cerr << "allocateBuffer failed, size=" << total_size << std::endl;
+        break;
+      }
+    }
 
     Context ctx = {host_data.data(), gpu_ptr, total_size, &log_mutex};
     recv_func(ctx);
 
     if (mode == "rdma_cpu") {
-      gpu_mem_op->freeBuffer(gpu_ptr);
+      if (gpu_ptr) gpu_mem_op->freeBuffer(gpu_ptr);
       std::this_thread::sleep_for(std::chrono::seconds(1));
       std::cout << "--------------------------------------------"
                 << std::endl;
@@ -315,16 +330,16 @@ int main(int argc, char *argv[]) {
     }
 
     if (mode == "g2h2g" || mode == "pipeline" || mode == "write") {
-      if (buffer->readToCpu(host_data.data(), total_size, 0) !=
+      if (buffer->readToCpu(host_data.data(), check_size, 0) !=
           status_t::SUCCESS) {
         std::cerr << "[" << mode << "] readToCpu failed." << std::endl;
       }
     } else {
-      gpu_mem_op->copyDeviceToHost(host_data.data(), gpu_ptr, total_size);
+      gpu_mem_op->copyDeviceToHost(host_data.data(), gpu_ptr, check_size);
     }
 
     bool valid = true;
-    for (size_t i = 0; i < std::min<size_t>(10, total_size); ++i) {
+    for (size_t i = 0; i < std::min<size_t>(10, check_size); ++i) {
       if (host_data[i] != 'A') {
         valid = false;
         break;
@@ -334,7 +349,7 @@ int main(int argc, char *argv[]) {
     std::cout << "[Size " << total_size << " B] Data Integrity: "
               << (valid ? "PASS" : "FAIL") << std::endl;
 
-    gpu_mem_op->freeBuffer(gpu_ptr);
+    if (gpu_ptr) gpu_mem_op->freeBuffer(gpu_ptr);
     std::this_thread::sleep_for(std::chrono::seconds(1));
     std::cout << "--------------------------------------------" << std::endl;
   }

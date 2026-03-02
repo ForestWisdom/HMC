@@ -39,3 +39,7 @@ CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write > write.log 
 export HMC_UHM_CHUNK=$((4*1024*1024))
 export HMC_UHM_SIGNAL_INTERVAL=16
 export HMC_UHM_PENDING_SIGNAL=8
+
+# test size range: 2^MIN_POWER .. 2^MAX_POWER bytes
+export MIN_POWER=5
+export MAX_POWER=29

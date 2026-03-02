@@ -50,6 +50,7 @@ struct Context {
 
 long long total_time = 0;
 std::mutex log_mutex;
+bool g_last_transfer_ok = true;
 
 using steady_clock_t = std::chrono::steady_clock;
 
@@ -277,30 +278,48 @@ static size_t pipeline_max_inflight = 64;
 
 void send_channel_slice_pipeline(Context ctx) {
   total_time = 0;
+  g_last_transfer_ok = false;
+  if (!ctx.gpu_data_ptr || ctx.size == 0) {
+    std::lock_guard<std::mutex> lock(*ctx.log_mutex);
+    std::cerr << "[Pipeline] invalid input ctx." << std::endl;
+    send_control_message("Finished");
+    return;
+  }
 
-  buffer->writeFromGpu(ctx.gpu_data_ptr, ctx.size, 0);
+  const size_t window = std::max<size_t>(1, buffer->buffer_size);
+  const size_t first_step = std::min(ctx.size, window);
+  if (buffer->writeFromGpu(ctx.gpu_data_ptr, first_step, 0) != status_t::SUCCESS) {
+    std::lock_guard<std::mutex> lock(*ctx.log_mutex);
+    std::cerr << "[Pipeline] writeFromGpu failed, step=" << first_step << std::endl;
+    send_control_message("Finished");
+    return;
+  }
 
   auto start = steady_clock_t::now();
-
-  auto status = comm->putPipeline(
-      server_ip, static_cast<uint16_t>(g_port),
-      0, 0,
-      ctx.size,
-      pipeline_chunk_size,
-      pipeline_max_inflight,
-      ConnType::RDMA);
-
+  size_t remaining = ctx.size;
+  while (remaining > 0) {
+    const size_t step = std::min(remaining, window);
+    auto status = comm->putPipeline(
+        server_ip, static_cast<uint16_t>(g_port),
+        0, 0,
+        step,
+        pipeline_chunk_size,
+        pipeline_max_inflight,
+        ConnType::RDMA);
+    if (status != status_t::SUCCESS) {
+      std::lock_guard<std::mutex> lock(*ctx.log_mutex);
+      std::cerr << "[Pipeline] putPipeline failed, step=" << step
+                << ", remaining=" << remaining << std::endl;
+      send_control_message("Finished");
+      return;
+    }
+    remaining -= step;
+  }
   auto end = steady_clock_t::now();
 
   total_time =
       std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-  if (status != status_t::SUCCESS) {
-    std::lock_guard<std::mutex> lock(*ctx.log_mutex);
-    std::cerr << "[Pipeline] putPipeline failed." << std::endl;
-    return;
-  }
-
+  g_last_transfer_ok = true;
   send_control_message("Finished");
 }
 
@@ -420,20 +439,45 @@ int main(int argc, char *argv[]) {
 
   sleep(3);
 
-  for (int power = 5; power <= 26; ++power) {
+  int min_power = static_cast<int>(get_env_u32_or_default("MIN_POWER", 5));
+  int max_power = static_cast<int>(get_env_u32_or_default(
+      "MAX_POWER", (mode == "write" || mode == "pipeline") ? 29 : 26));
+  if (min_power < 1) min_power = 1;
+  if (max_power < min_power) max_power = min_power;
+
+  for (int power = min_power; power <= max_power; ++power) {
     size_t total_size = (size_t)1 << power;
-    std::vector<uint8_t> host_data(total_size, 'A');
+    size_t src_size = (mode == "write" || mode == "pipeline")
+                          ? std::min(total_size, buffer->buffer_size)
+                          : total_size;
+    std::vector<uint8_t> host_data(src_size, 'A');
 
     void *device_ptr = nullptr;
-    gpu_mem_op->allocateBuffer(&device_ptr, total_size);
-    gpu_mem_op->copyHostToDevice(device_ptr, host_data.data(), total_size);
+    if (gpu_mem_op->allocateBuffer(&device_ptr, src_size) != status_t::SUCCESS ||
+        !device_ptr) {
+      std::cerr << "allocateBuffer failed, size=" << src_size << std::endl;
+      break;
+    }
+    if (gpu_mem_op->copyHostToDevice(device_ptr, host_data.data(), src_size) !=
+        status_t::SUCCESS) {
+      std::cerr << "copyHostToDevice failed, size=" << src_size << std::endl;
+      gpu_mem_op->freeBuffer(device_ptr);
+      break;
+    }
 
     Context ctx = {.cpu_data_ptr = host_data.data(),
                    .gpu_data_ptr = device_ptr,
                    .size = total_size,
                    .log_mutex = &log_mutex};
 
+    g_last_transfer_ok = true;
     send_func(ctx);
+    if (!g_last_transfer_ok || total_time <= 0) {
+      std::cerr << "[Mode: " << mode << "] transfer failed at size="
+                << total_size << " B" << std::endl;
+      gpu_mem_op->freeBuffer(device_ptr);
+      break;
+    }
 
     double time_s = total_time / 1e6;
     double gbps = (total_size * 8.0) / time_s / 1e9;
