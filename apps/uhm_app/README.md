@@ -3,6 +3,11 @@ export SERVER_IP=192.168.2.244
 export CLIENT_IP=192.168.2.244
 export TCP_SERVER_IP=192.168.2.244
 
+# optional defaults (used only when SERVER_IP/CLIENT_IP/TCP_SERVER_IP are unset)
+export DEFAULT_SERVER_IP=192.168.2.248
+export DEFAULT_CLIENT_IP=192.168.2.249
+export DEFAULT_TCP_IP=192.168.2.248
+
 CUDA_VISIBLE_DEVICES=5 ./build/apps/uhm_app/uhm_server --mode uhm
 CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode uhm > uhm.log 2>&1
 

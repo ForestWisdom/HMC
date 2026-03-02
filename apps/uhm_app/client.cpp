@@ -445,9 +445,16 @@ int main(int argc, char *argv[]) {
   string mode = get_mode_from_args(argc, argv);
   std::cout << "Running in mode: " << mode << std::endl;
 
-  server_ip = get_env_or_default("SERVER_IP", DEFAULT_SERVER_IP);
-  client_ip = get_env_or_default("CLIENT_IP", DEFAULT_CLIENT_IP);
-  tcp_server_ip = get_env_or_default("TCP_SERVER_IP", DEFAULT_TCP_IP);
+  const std::string default_server_ip =
+      get_env_or_default("DEFAULT_SERVER_IP", DEFAULT_SERVER_IP);
+  const std::string default_client_ip =
+      get_env_or_default("DEFAULT_CLIENT_IP", DEFAULT_CLIENT_IP);
+  const std::string default_tcp_ip =
+      get_env_or_default("DEFAULT_TCP_IP", DEFAULT_TCP_IP);
+
+  server_ip = get_env_or_default("SERVER_IP", default_server_ip);
+  client_ip = get_env_or_default("CLIENT_IP", default_client_ip);
+  tcp_server_ip = get_env_or_default("TCP_SERVER_IP", default_tcp_ip);
 
   self_rank = get_env_u32_or_default("SELF_RANK", 1);
   peer_rank = get_env_u32_or_default("PEER_RANK", 0);
