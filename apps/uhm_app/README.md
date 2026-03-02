@@ -39,6 +39,11 @@ CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write > write.log 
 CUDA_VISIBLE_DEVICES=5 ./build/apps/uhm_app/uhm_server --mode write_cpu
 CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write_cpu > write_cpu.log 2>&1
 
+# staged path: MLU -> CPU staging + RDMA write
+export STAGE_CHUNK=$((8*1024*1024))
+CUDA_VISIBLE_DEVICES=5 ./build/apps/uhm_app/uhm_server --mode write_stage
+CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write_stage > write_stage.log 2>&1
+
 # UHM mode tuning (optional)
 export HMC_UHM_CHUNK=$((4*1024*1024))
 export HMC_UHM_SIGNAL_INTERVAL=16

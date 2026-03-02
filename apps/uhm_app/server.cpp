@@ -209,7 +209,7 @@ std::string get_mode_from_args(int argc, char *argv[]) {
       string mode = argv[i + 1];
       if (mode == "uhm" || mode == "serial" || mode == "g2h2g" ||
           mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline" ||
-          mode == "write" || mode == "write_cpu")
+          mode == "write" || mode == "write_cpu" || mode == "write_stage")
         return mode;
       cerr << "Invalid mode: " << mode << endl;
       exit(1);
@@ -234,7 +234,8 @@ int main(int argc, char *argv[]) {
   std::mutex log_mutex;
 
   const bool use_cpu_buffer =
-      (mode == "g2h2g" || mode == "ucx" || mode == "write_cpu");
+      (mode == "g2h2g" || mode == "ucx" || mode == "write_cpu" ||
+       mode == "write_stage");
 
   if (use_cpu_buffer) {
     buffer = std::make_shared<ConnBuffer>(0, buffer_size, MemoryType::CPU);
@@ -246,7 +247,8 @@ int main(int argc, char *argv[]) {
   int num_channels = get_env_u32_or_default("NUM_CHANNELS", 1);
   std::cout << "Using " << num_channels << " QPs" << std::endl;
 
-  if (mode == "pipeline" || mode == "write" || mode == "write_cpu") {
+  if (mode == "pipeline" || mode == "write" || mode == "write_cpu" ||
+      mode == "write_stage") {
     pipeline_chunk_size = get_env_u32_or_default("PIPELINE_CHUNK", 4 * 1024 * 1024);
     pipeline_max_inflight = get_env_u32_or_default("PIPELINE_INFLIGHT", 64);
     std::cout << "Pipeline: chunk=" << (pipeline_chunk_size / 1024 / 1024) 
@@ -292,7 +294,8 @@ int main(int argc, char *argv[]) {
     recv_func = recv_channel_slice_rdma_cpu;
   else if (mode == "ucx")
     recv_func = recv_channel_slice_ucx;
-  else if (mode == "pipeline" || mode == "write" || mode == "write_cpu")
+  else if (mode == "pipeline" || mode == "write" || mode == "write_cpu" ||
+           mode == "write_stage")
     recv_func = recv_channel_slice_pipeline;
   else
     recv_func = recv_channel_slice_uhm;
@@ -300,7 +303,8 @@ int main(int argc, char *argv[]) {
   int min_power = static_cast<int>(get_env_u32_or_default("MIN_POWER", 5));
   int max_power = static_cast<int>(get_env_u32_or_default(
       "MAX_POWER",
-      (mode == "write" || mode == "pipeline" || mode == "write_cpu") ? 29 : 26));
+      (mode == "write" || mode == "pipeline" || mode == "write_cpu" ||
+       mode == "write_stage") ? 29 : 26));
   if (min_power < 1) min_power = 1;
   if (max_power < min_power) max_power = min_power;
 
@@ -311,8 +315,12 @@ int main(int argc, char *argv[]) {
                             : total_size;
     std::vector<uint8_t> host_data(check_size, 0);
 
+    const bool verify_from_buffer =
+        (mode == "g2h2g" || mode == "pipeline" || mode == "write" ||
+         mode == "write_cpu" || mode == "write_stage");
+
     void *gpu_ptr = nullptr;
-    if (mode != "pipeline" && mode != "write") {
+    if (!verify_from_buffer) {
       if (gpu_mem_op->allocateBuffer(&gpu_ptr, total_size) != status_t::SUCCESS ||
           !gpu_ptr) {
         std::cerr << "allocateBuffer failed, size=" << total_size << std::endl;
@@ -331,7 +339,7 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    if (mode == "g2h2g" || mode == "pipeline" || mode == "write") {
+    if (verify_from_buffer) {
       if (buffer->readToCpu(host_data.data(), check_size, 0) !=
           status_t::SUCCESS) {
         std::cerr << "[" << mode << "] readToCpu failed." << std::endl;
