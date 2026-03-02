@@ -310,14 +310,14 @@ int main(int argc, char *argv[]) {
 
   for (int power = min_power; power <= max_power; ++power) {
     size_t total_size = size_t(1) << power;
-    size_t check_size = (mode == "pipeline" || mode == "write")
-                            ? std::min(total_size, buffer_size)
-                            : total_size;
-    std::vector<uint8_t> host_data(check_size, 0);
-
     const bool verify_from_buffer =
         (mode == "g2h2g" || mode == "pipeline" || mode == "write" ||
          mode == "write_cpu" || mode == "write_stage");
+    const size_t buffer_window =
+        (buffer && buffer->buffer_size > 0) ? buffer->buffer_size : buffer_size;
+    size_t check_size = verify_from_buffer ? std::min(total_size, buffer_window)
+                                           : total_size;
+    std::vector<uint8_t> host_data(check_size, 0);
 
     void *gpu_ptr = nullptr;
     if (!verify_from_buffer) {

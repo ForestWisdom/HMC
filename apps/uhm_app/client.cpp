@@ -276,6 +276,7 @@ void send_channel_slice_ucx(Context ctx) {
 static size_t pipeline_chunk_size = 4 * 1024 * 1024;  // 4MB default
 static size_t pipeline_max_inflight = 64;
 static size_t stage_chunk_size = 8 * 1024 * 1024;
+static size_t stage_slots = 0;
 
 void send_channel_slice_pipeline(Context ctx) {
   total_time = 0;
@@ -349,15 +350,19 @@ void send_channel_slice_write_stage(Context ctx) {
 
   const size_t half = buffer->buffer_size / 2;
   size_t chunk = std::max<size_t>(1, std::min(stage_chunk_size, half));
-  uint64_t inflight[2] = {0, 0};
+  size_t slots_by_buf = std::max<size_t>(1, buffer->buffer_size / chunk);
+  size_t slots = stage_slots == 0 ? slots_by_buf : std::min(stage_slots, slots_by_buf);
+  slots = std::max<size_t>(1, slots);
+  std::vector<uint64_t> inflight(slots, 0);
+  const size_t src_window = std::max<size_t>(1, std::min(ctx.size, buffer->buffer_size));
 
   auto start = steady_clock_t::now();
   size_t sent = 0;
   size_t idx = 0;
   while (sent < ctx.size) {
-    const size_t slot = idx % 2;
-    const size_t local_off = slot * half;
-    const size_t remote_off = slot * half;
+    const size_t slot = idx % slots;
+    const size_t local_off = slot * chunk;
+    const size_t remote_off = slot * chunk;
     const size_t step = std::min(chunk, ctx.size - sent);
 
     if (inflight[slot] != 0) {
@@ -370,8 +375,9 @@ void send_channel_slice_write_stage(Context ctx) {
       inflight[slot] = 0;
     }
 
+    void *gpu_src = static_cast<char *>(ctx.gpu_data_ptr) + (sent % src_window);
     if (gpu_mem_op->copyDeviceToHost(static_cast<char *>(buffer->ptr) + local_off,
-                                     ctx.gpu_data_ptr, step) != status_t::SUCCESS) {
+                                     gpu_src, step) != status_t::SUCCESS) {
       std::lock_guard<std::mutex> lock(*ctx.log_mutex);
       std::cerr << "[WriteStage] copyDeviceToHost failed, step=" << step
                 << std::endl;
@@ -393,7 +399,7 @@ void send_channel_slice_write_stage(Context ctx) {
     idx++;
   }
 
-  for (int i = 0; i < 2; ++i) {
+  for (size_t i = 0; i < inflight.size(); ++i) {
     if (inflight[i] != 0) {
       if (comm->wait(inflight[i]) != status_t::SUCCESS) {
         std::lock_guard<std::mutex> lock(*ctx.log_mutex);
@@ -451,8 +457,12 @@ int main(int argc, char *argv[]) {
   }
   if (mode == "write_stage") {
     stage_chunk_size = get_env_u32_or_default("STAGE_CHUNK", 8 * 1024 * 1024);
+    stage_slots = get_env_u32_or_default("STAGE_SLOTS", 0);
     std::cout << "WriteStage: stage_chunk=" << (stage_chunk_size / 1024 / 1024)
-              << "MB" << std::endl;
+              << "MB, stage_slots="
+              << (stage_slots == 0 ? std::string("auto")
+                                   : std::to_string(stage_slots))
+              << std::endl;
   }
 
   const bool use_cpu_buffer =

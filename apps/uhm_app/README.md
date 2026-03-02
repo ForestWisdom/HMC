@@ -41,6 +41,7 @@ CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write_cpu > write_
 
 # staged path: MLU -> CPU staging + RDMA write
 export STAGE_CHUNK=$((8*1024*1024))
+export STAGE_SLOTS=0   # 0=auto (buffer_size / STAGE_CHUNK)
 CUDA_VISIBLE_DEVICES=5 ./build/apps/uhm_app/uhm_server --mode write_stage
 CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write_stage > write_stage.log 2>&1
 
