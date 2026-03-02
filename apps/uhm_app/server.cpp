@@ -199,6 +199,7 @@ static size_t pipeline_chunk_size = 4 * 1024 * 1024;
 static size_t pipeline_max_inflight = 64;
 
 void recv_channel_slice_pipeline(Context ctx) {
+  (void)ctx;
   wait_for_control_message(ctrl_socket_fd);
 }
 
@@ -207,7 +208,8 @@ std::string get_mode_from_args(int argc, char *argv[]) {
     if (string(argv[i]) == "--mode" && i + 1 < argc) {
       string mode = argv[i + 1];
       if (mode == "uhm" || mode == "serial" || mode == "g2h2g" ||
-          mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline")
+          mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline" ||
+          mode == "write")
         return mode;
       cerr << "Invalid mode: " << mode << endl;
       exit(1);
@@ -243,7 +245,7 @@ int main(int argc, char *argv[]) {
   int num_channels = get_env_u32_or_default("NUM_CHANNELS", 1);
   std::cout << "Using " << num_channels << " QPs" << std::endl;
 
-  if (mode == "pipeline") {
+  if (mode == "pipeline" || mode == "write") {
     pipeline_chunk_size = get_env_u32_or_default("PIPELINE_CHUNK", 4 * 1024 * 1024);
     pipeline_max_inflight = get_env_u32_or_default("PIPELINE_INFLIGHT", 64);
     std::cout << "Pipeline: chunk=" << (pipeline_chunk_size / 1024 / 1024) 
@@ -289,7 +291,7 @@ int main(int argc, char *argv[]) {
     recv_func = recv_channel_slice_rdma_cpu;
   else if (mode == "ucx")
     recv_func = recv_channel_slice_ucx;
-  else if (mode == "pipeline")
+  else if (mode == "pipeline" || mode == "write")
     recv_func = recv_channel_slice_pipeline;
   else
     recv_func = recv_channel_slice_uhm;
@@ -312,10 +314,10 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    if (mode == "g2h2g") {
+    if (mode == "g2h2g" || mode == "pipeline" || mode == "write") {
       if (buffer->readToCpu(host_data.data(), total_size, 0) !=
           status_t::SUCCESS) {
-        std::cerr << "[G2H2G] readToCpu failed." << std::endl;
+        std::cerr << "[" << mode << "] readToCpu failed." << std::endl;
       }
     } else {
       gpu_mem_op->copyDeviceToHost(host_data.data(), gpu_ptr, total_size);

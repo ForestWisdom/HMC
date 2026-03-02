@@ -309,7 +309,8 @@ std::string get_mode_from_args(int argc, char *argv[]) {
     if (string(argv[i]) == "--mode" && i + 1 < argc) {
       string mode = argv[i + 1];
       if (mode == "uhm" || mode == "serial" || mode == "g2h2g" ||
-          mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline")
+          mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline" ||
+          mode == "write")
         return mode;
       cerr << "Invalid mode: " << mode << "\n";
       exit(1);
@@ -334,7 +335,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Using " << num_channels << " QPs" << std::endl;
 
   // Pipeline parameters
-  if (mode == "pipeline") {
+  if (mode == "pipeline" || mode == "write") {
     pipeline_chunk_size = get_env_u32_or_default("PIPELINE_CHUNK", 4 * 1024 * 1024);
     pipeline_max_inflight = get_env_u32_or_default("PIPELINE_INFLIGHT", 64);
     std::cout << "Pipeline: chunk=" << (pipeline_chunk_size / 1024 / 1024) 
@@ -407,7 +408,7 @@ int main(int argc, char *argv[]) {
     send_func = send_channel_slice_rdma_cpu;
   else if (mode == "ucx")
     send_func = send_channel_slice_ucx;
-  else if (mode == "pipeline")
+  else if (mode == "pipeline" || mode == "write")
     send_func = send_channel_slice_pipeline;
   else
     send_func = send_channel_slice_uhm;

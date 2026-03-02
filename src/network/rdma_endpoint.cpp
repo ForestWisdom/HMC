@@ -538,19 +538,38 @@ status_t RDMAEndpoint::readDataPipeline(size_t local_off, size_t remote_off, siz
 
 status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
                                 MemoryType mem_type) {
-  status_t ret;
+  if (send_flags == 0) return status_t::SUCCESS;
+  if (!input_buffer) return status_t::ERROR;
 
   const size_t half_buffer_size = buffer->buffer_size / 2;
-  const size_t num_send_chunks =
-      (send_flags + half_buffer_size - 1) / half_buffer_size;
+  if (half_buffer_size == 0) {
+    logError("Client::Send: invalid half buffer size 0");
+    return status_t::ERROR;
+  }
+  if (send_flags > std::numeric_limits<UHM_STATE_TYPE>::max()) {
+    logError("Client::Send: send size %zu exceeds UHM_STATE_TYPE limit", send_flags);
+    return status_t::ERROR;
+  }
+
+  size_t chunk_size = static_cast<size_t>(
+      envU32OrDefault("HMC_UHM_CHUNK", static_cast<uint32_t>(half_buffer_size)));
+  chunk_size = std::max<size_t>(1, std::min(chunk_size, half_buffer_size));
+  size_t signal_interval = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_SIGNAL_INTERVAL", 16)));
+  size_t max_pending_signal = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_PENDING_SIGNAL", 8)));
+
+  const size_t num_send_chunks = (send_flags + chunk_size - 1) / chunk_size;
   size_t current_chunk = 0;
   size_t chunk_index = 0;
-  size_t send_size = std::min(half_buffer_size, send_flags);
+  size_t send_size = std::min(chunk_size, send_flags);
+  status_t ret;
 
   // set flags
   uhm_buffer_state.state[0] = UHM_BUFFER_CAN_WRITE;
   uhm_buffer_state.state[1] = UHM_BUFFER_CAN_WRITE;
-  uhm_buffer_state.length = send_flags;
+  uhm_buffer_state.length = static_cast<UHM_STATE_TYPE>(send_flags);
+  uhm_buffer_state.chunk_bytes = static_cast<UHM_STATE_TYPE>(chunk_size);
 
   // write buffer_state (use qp 0 for flag bootstrap)
   void *localAddr = reinterpret_cast<char *>(&uhm_buffer_state);
@@ -566,21 +585,26 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
   }
 
   // pre-fill first half buffer
+  void *first_src = static_cast<char *>(input_buffer);
   mem_type == MemoryType::CPU
-      ? buffer->writeFromCpu(input_buffer, send_size, 0)
-      : buffer->writeFromGpu(input_buffer, send_size, 0);
+      ? buffer->writeFromCpu(first_src, send_size, 0)
+      : buffer->writeFromGpu(first_src, send_size, 0);
 
   if (waitWrId(wr_id) != status_t::SUCCESS) {
     logError("Client::Send: Failed to poll completion for state write");
     return status_t::ERROR;
   }
 
+  std::vector<uint64_t> pending_signaled;
+  pending_signaled.reserve(max_pending_signal);
+  size_t since_last_signal = 0;
+  const int SPIN_COUNT = 100;
+
   while (current_chunk < num_send_chunks) {
     chunk_index = current_chunk % 2;
     size_t next_chunk_index = (current_chunk + 1) % 2;
 
     // spin until remote allows write on this half
-    const int SPIN_COUNT = 100;
     while (uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_WRITE) {
       int spin = 0;
       while (spin++ < SPIN_COUNT &&
@@ -597,19 +621,22 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
     }
 
     // this chunk size
-    size_t remaining = send_flags - current_chunk * half_buffer_size;
-    send_size = std::min(half_buffer_size, remaining);
+    size_t remaining = send_flags - current_chunk * chunk_size;
+    send_size = std::min(chunk_size, remaining);
+    const bool is_last = (current_chunk + 1) >= num_send_chunks;
+    const bool signal_flag = (signal_interval <= 1) || is_last ||
+                             ((since_last_signal + 1) >= signal_interval);
 
     // choose qp for this chunk to keep ordering between data and flag
-    size_t qp_idx = current_chunk % num_qps_;
+    size_t qp_idx = current_chunk % std::max<size_t>(num_qps_, 1);
 
-    // post data write
+    // post data write unsignaled; completion is tracked by flag write.
     void *data_local = static_cast<char *>(buffer->ptr) + chunk_index * half_buffer_size;
     void *data_remote =
         reinterpret_cast<char *>(remote_metadata_attr.address) + chunk_index * half_buffer_size;
-    wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t data_wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
     ret = postWrite(data_local, data_remote, send_size, buffer_mr,
-                    remote_metadata_attr.key, wr_id, true, qp_idx);
+                    remote_metadata_attr.key, data_wr_id, false, qp_idx);
     if (ret != status_t::SUCCESS) {
       logError("Client::Send: Failed to post write data for chunk %zu",
                current_chunk);
@@ -623,33 +650,50 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
     void *flag_remote =
         reinterpret_cast<char *>(remote_metadata_attr.uhm_buffer_state_address) +
         chunk_index * sizeof(UHM_STATE_TYPE);
+    uint64_t flag_wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
     ret = postWrite(flag_local, flag_remote, sizeof(UHM_STATE_TYPE),
                     uhm_buffer_state_mr,
-                    remote_metadata_attr.uhm_buffer_state_key, wr_id, true, qp_idx);
+                    remote_metadata_attr.uhm_buffer_state_key,
+                    flag_wr_id, signal_flag, qp_idx);
     if (ret != status_t::SUCCESS) {
       logError("Client::Send: Failed to post write buffer state");
       return ret;
     }
+    if (signal_flag) {
+      pending_signaled.push_back(flag_wr_id);
+      since_last_signal = 0;
+    } else {
+      since_last_signal++;
+    }
 
     // pre-fill next half if any
     if (current_chunk + 1 < num_send_chunks) {
-      size_t next_remaining =
-          send_flags - (current_chunk + 1) * half_buffer_size;
-      size_t next_size = std::min(half_buffer_size, next_remaining);
+      size_t next_remaining = send_flags - (current_chunk + 1) * chunk_size;
+      size_t next_size = std::min(chunk_size, next_remaining);
       size_t bias = next_chunk_index * half_buffer_size;
+      void *next_src = static_cast<char *>(input_buffer) +
+                       (current_chunk + 1) * chunk_size;
       mem_type == MemoryType::CPU
-          ? buffer->writeFromCpu(input_buffer, next_size, bias)
-          : buffer->writeFromGpu(input_buffer, next_size, bias);
+          ? buffer->writeFromCpu(next_src, next_size, bias)
+          : buffer->writeFromGpu(next_src, next_size, bias);
     }
 
-    // wait completion for data+flag
-    if (waitWrId(wr_id) != status_t::SUCCESS) {
-      logError("Client::Send: Failed to poll completion for chunk %zu",
-               current_chunk);
-      return status_t::ERROR;
+    if (pending_signaled.size() >= max_pending_signal) {
+      if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+        logError("Client::Send: waitWrIdMulti failed for signaled flags");
+        return status_t::ERROR;
+      }
+      pending_signaled.clear();
     }
 
     current_chunk++;
+  }
+
+  if (!pending_signaled.empty()) {
+    if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+      logError("Client::Send: final waitWrIdMulti failed");
+      return status_t::ERROR;
+    }
   }
 
   return status_t::SUCCESS;
@@ -657,6 +701,7 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
 
 status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
                                 size_t *recv_flags, MemoryType mem_type) {
+  if (!output_buffer || !recv_flags) return status_t::ERROR;
   status_t ret;
   size_t current_chunk = 0;
   size_t chunk_index = 0;
@@ -664,11 +709,17 @@ status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
   size_t recv_size = 0;
   const size_t half_buffer_size = buffer->buffer_size / 2;
   size_t num_recv_chunks = 0;
+  size_t recv_chunk_size = half_buffer_size;
+  if (half_buffer_size == 0) {
+    logError("Server::Recv: invalid half buffer size 0");
+    return status_t::ERROR;
+  }
 
   // init states so sender can see we're ready
   uhm_buffer_state.state[0] = UHM_BUFFER_CAN_READ;
   uhm_buffer_state.state[1] = UHM_BUFFER_CAN_READ;
   uhm_buffer_state.length = 0;
+  uhm_buffer_state.chunk_bytes = 0;
 
   // wait for length + initial states
   const int SPIN_COUNT = 100;
@@ -680,7 +731,10 @@ status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
         logError("Server::Recv: Invalid receive size is 0");
         return status_t::ERROR;
       }
-      num_recv_chunks = (*recv_flags + half_buffer_size - 1) / half_buffer_size;
+      recv_chunk_size = static_cast<size_t>(tmp.chunk_bytes);
+      if (recv_chunk_size == 0) recv_chunk_size = half_buffer_size;
+      recv_chunk_size = std::max<size_t>(1, std::min(recv_chunk_size, half_buffer_size));
+      num_recv_chunks = (*recv_flags + recv_chunk_size - 1) / recv_chunk_size;
       this->uhm_buffer_state.state[0] = UHM_BUFFER_CAN_WRITE;
       this->uhm_buffer_state.state[1] = UHM_BUFFER_CAN_WRITE;
       break;
@@ -698,64 +752,102 @@ status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
   }
 
   // receive chunks
-  uint64_t wr_id;
+  size_t signal_interval = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_SIGNAL_INTERVAL", 16)));
+  size_t max_pending_signal = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_PENDING_SIGNAL", 8)));
+  std::vector<uint64_t> pending_signaled;
+  pending_signaled.reserve(max_pending_signal);
+  size_t since_last_signal = 0;
+
   while (current_chunk < num_recv_chunks) {
     chunk_index = current_chunk % 2;
     // choose qp for this chunk (for ordering of flag write-back)
-    size_t qp_idx = current_chunk % num_qps_;
+    size_t qp_idx = current_chunk % std::max<size_t>(num_qps_, 1);
 
-    if (this->uhm_buffer_state.state[chunk_index] == UHM_BUFFER_CAN_READ) {
-      // immediately grant write permission back to sender (same QP)
-      this->uhm_buffer_state.state[chunk_index] = UHM_BUFFER_CAN_WRITE;
-      void *flag_local = reinterpret_cast<char *>(&uhm_buffer_state) +
-                         chunk_index * sizeof(UHM_STATE_TYPE);
-      void *flag_remote =
-          reinterpret_cast<char *>(remote_metadata_attr.uhm_buffer_state_address) +
-          chunk_index * sizeof(UHM_STATE_TYPE);
-      wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
-      ret = postWrite(flag_local, flag_remote, sizeof(UHM_STATE_TYPE),
-                      uhm_buffer_state_mr,
-                      remote_metadata_attr.uhm_buffer_state_key, wr_id, true, qp_idx);
-      if (ret != status_t::SUCCESS) {
-        logError("Server::Recv: Failed to post write buffer state");
-        return ret;
+    if (this->uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_READ) {
+      int spin = 0;
+      while (spin++ < SPIN_COUNT &&
+             this->uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_READ) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#endif
       }
-
-      // compute receive size
-      if (current_chunk == num_recv_chunks - 1) {
-        recv_size = *recv_flags - accumulated_size;
-      } else {
-        recv_size = half_buffer_size;
+      if (this->uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_READ) {
+        std::this_thread::yield();
       }
-      // boundary checks
-      if (recv_size == 0) {
-        logError("Server::Recv: Invalid receive size is 0");
-        return status_t::ERROR;
-      } else if (recv_size > buffer_size) {
-        logError("Server::Recv: Invalid receive size %zu > buffer_size %zu",
-                 recv_size, buffer_size);
-        return status_t::ERROR;
-      } else if (accumulated_size + recv_size > buffer_size) {
-        logError("Server::Recv: accumulated_size + recv_size > buffer_size");
-        return status_t::ERROR;
-      }
-
-      // copy to output
-      size_t bias = chunk_index * half_buffer_size;
-      void *dest = static_cast<char *>(output_buffer) + accumulated_size;
-      mem_type == MemoryType::CPU ? buffer->readToCpu(dest, recv_size, bias)
-                                  : buffer->readToGpu(dest, recv_size, bias);
-
-      // ensure flag write completion processed
-      if (waitWrId(wr_id) != status_t::SUCCESS) {
-        logError("Failed to poll completion queue");
-        return status_t::ERROR;
-      }
-
-      accumulated_size += recv_size;
-      current_chunk++;
+      continue;
     }
-  };
+
+    // compute receive size
+    if (current_chunk == num_recv_chunks - 1) {
+      recv_size = *recv_flags - accumulated_size;
+    } else {
+      recv_size = recv_chunk_size;
+    }
+    // boundary checks
+    if (recv_size == 0) {
+      logError("Server::Recv: Invalid receive size is 0");
+      return status_t::ERROR;
+    } else if (recv_size > buffer_size) {
+      logError("Server::Recv: Invalid receive size %zu > buffer_size %zu",
+               recv_size, buffer_size);
+      return status_t::ERROR;
+    } else if (accumulated_size + recv_size > buffer_size) {
+      logError("Server::Recv: accumulated_size + recv_size > buffer_size");
+      return status_t::ERROR;
+    }
+
+    // copy out first, then grant write-back to avoid overwrite race.
+    size_t bias = chunk_index * half_buffer_size;
+    void *dest = static_cast<char *>(output_buffer) + accumulated_size;
+    mem_type == MemoryType::CPU ? buffer->readToCpu(dest, recv_size, bias)
+                                : buffer->readToGpu(dest, recv_size, bias);
+
+    this->uhm_buffer_state.state[chunk_index] = UHM_BUFFER_CAN_WRITE;
+    void *flag_local = reinterpret_cast<char *>(&uhm_buffer_state) +
+                       chunk_index * sizeof(UHM_STATE_TYPE);
+    void *flag_remote =
+        reinterpret_cast<char *>(remote_metadata_attr.uhm_buffer_state_address) +
+        chunk_index * sizeof(UHM_STATE_TYPE);
+    const bool is_last = (current_chunk + 1) >= num_recv_chunks;
+    const bool signal_flag = (signal_interval <= 1) || is_last ||
+                             ((since_last_signal + 1) >= signal_interval);
+    uint64_t flag_wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
+    ret = postWrite(flag_local, flag_remote, sizeof(UHM_STATE_TYPE),
+                    uhm_buffer_state_mr,
+                    remote_metadata_attr.uhm_buffer_state_key,
+                    flag_wr_id, signal_flag, qp_idx);
+    if (ret != status_t::SUCCESS) {
+      logError("Server::Recv: Failed to post write buffer state");
+      return ret;
+    }
+    if (signal_flag) {
+      pending_signaled.push_back(flag_wr_id);
+      since_last_signal = 0;
+    } else {
+      since_last_signal++;
+    }
+    if (pending_signaled.size() >= max_pending_signal) {
+      if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+        logError("Server::Recv: waitWrIdMulti failed for signaled flags");
+        return status_t::ERROR;
+      }
+      pending_signaled.clear();
+    }
+
+    accumulated_size += recv_size;
+    current_chunk++;
+  }
+
+  if (!pending_signaled.empty()) {
+    if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+      logError("Server::Recv: final waitWrIdMulti failed");
+      return status_t::ERROR;
+    }
+  }
 
   return status_t::SUCCESS;
 }

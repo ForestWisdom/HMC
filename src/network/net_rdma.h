@@ -58,6 +58,7 @@ typedef enum {
 struct __attribute__((packed)) UHMBufferState {
   volatile UHM_STATE_TYPE state[2];
   volatile UHM_STATE_TYPE length;
+  volatile UHM_STATE_TYPE chunk_bytes;
 };
 
 struct __attribute__((packed)) rdma_buffer_attr {
