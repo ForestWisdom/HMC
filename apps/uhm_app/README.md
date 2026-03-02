@@ -35,6 +35,10 @@ export HMC_RDMA_PATH_MTU=4096
 CUDA_VISIBLE_DEVICES=5 ./build/apps/uhm_app/uhm_server --mode write
 CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write > write.log 2>&1
 
+# CPU ConnBuffer write benchmark (isolates RDMA path from MLU memory path)
+CUDA_VISIBLE_DEVICES=5 ./build/apps/uhm_app/uhm_server --mode write_cpu
+CUDA_VISIBLE_DEVICES=6 ./build/apps/uhm_app/uhm_client --mode write_cpu > write_cpu.log 2>&1
+
 # UHM mode tuning (optional)
 export HMC_UHM_CHUNK=$((4*1024*1024))
 export HMC_UHM_SIGNAL_INTERVAL=16

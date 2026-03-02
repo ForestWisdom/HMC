@@ -279,7 +279,7 @@ static size_t pipeline_max_inflight = 64;
 void send_channel_slice_pipeline(Context ctx) {
   total_time = 0;
   g_last_transfer_ok = false;
-  if (!ctx.gpu_data_ptr || ctx.size == 0) {
+  if ((!ctx.gpu_data_ptr && buffer->mem_type != MemoryType::CPU) || ctx.size == 0) {
     std::lock_guard<std::mutex> lock(*ctx.log_mutex);
     std::cerr << "[Pipeline] invalid input ctx." << std::endl;
     send_control_message("Finished");
@@ -288,9 +288,16 @@ void send_channel_slice_pipeline(Context ctx) {
 
   const size_t window = std::max<size_t>(1, buffer->buffer_size);
   const size_t first_step = std::min(ctx.size, window);
-  if (buffer->writeFromGpu(ctx.gpu_data_ptr, first_step, 0) != status_t::SUCCESS) {
+  status_t stage_ret = status_t::SUCCESS;
+  if (buffer->mem_type == MemoryType::CPU) {
+    stage_ret = buffer->writeFromCpu(ctx.cpu_data_ptr, first_step, 0);
+  } else {
+    stage_ret = buffer->writeFromGpu(ctx.gpu_data_ptr, first_step, 0);
+  }
+  if (stage_ret != status_t::SUCCESS) {
     std::lock_guard<std::mutex> lock(*ctx.log_mutex);
-    std::cerr << "[Pipeline] writeFromGpu failed, step=" << first_step << std::endl;
+    std::cerr << "[Pipeline] staging to ConnBuffer failed, step=" << first_step
+              << std::endl;
     send_control_message("Finished");
     return;
   }
@@ -329,7 +336,7 @@ std::string get_mode_from_args(int argc, char *argv[]) {
       string mode = argv[i + 1];
       if (mode == "uhm" || mode == "serial" || mode == "g2h2g" ||
           mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline" ||
-          mode == "write")
+          mode == "write" || mode == "write_cpu")
         return mode;
       cerr << "Invalid mode: " << mode << "\n";
       exit(1);
@@ -354,14 +361,15 @@ int main(int argc, char *argv[]) {
   std::cout << "Using " << num_channels << " QPs" << std::endl;
 
   // Pipeline parameters
-  if (mode == "pipeline" || mode == "write") {
+  if (mode == "pipeline" || mode == "write" || mode == "write_cpu") {
     pipeline_chunk_size = get_env_u32_or_default("PIPELINE_CHUNK", 4 * 1024 * 1024);
     pipeline_max_inflight = get_env_u32_or_default("PIPELINE_INFLIGHT", 64);
     std::cout << "Pipeline: chunk=" << (pipeline_chunk_size / 1024 / 1024) 
               << "MB, max_inflight=" << pipeline_max_inflight << std::endl;
   }
 
-  const bool use_cpu_buffer = (mode == "g2h2g" || mode == "ucx");
+  const bool use_cpu_buffer =
+      (mode == "g2h2g" || mode == "ucx" || mode == "write_cpu");
 
   if (use_cpu_buffer) {
     buffer = std::make_shared<ConnBuffer>(0, buffer_size, MemoryType::CPU);
@@ -427,7 +435,7 @@ int main(int argc, char *argv[]) {
     send_func = send_channel_slice_rdma_cpu;
   else if (mode == "ucx")
     send_func = send_channel_slice_ucx;
-  else if (mode == "pipeline" || mode == "write")
+  else if (mode == "pipeline" || mode == "write" || mode == "write_cpu")
     send_func = send_channel_slice_pipeline;
   else
     send_func = send_channel_slice_uhm;
@@ -441,28 +449,31 @@ int main(int argc, char *argv[]) {
 
   int min_power = static_cast<int>(get_env_u32_or_default("MIN_POWER", 5));
   int max_power = static_cast<int>(get_env_u32_or_default(
-      "MAX_POWER", (mode == "write" || mode == "pipeline") ? 29 : 26));
+      "MAX_POWER",
+      (mode == "write" || mode == "pipeline" || mode == "write_cpu") ? 29 : 26));
   if (min_power < 1) min_power = 1;
   if (max_power < min_power) max_power = min_power;
 
   for (int power = min_power; power <= max_power; ++power) {
     size_t total_size = (size_t)1 << power;
-    size_t src_size = (mode == "write" || mode == "pipeline")
+    size_t src_size = (mode == "write" || mode == "pipeline" || mode == "write_cpu")
                           ? std::min(total_size, buffer->buffer_size)
                           : total_size;
     std::vector<uint8_t> host_data(src_size, 'A');
 
     void *device_ptr = nullptr;
-    if (gpu_mem_op->allocateBuffer(&device_ptr, src_size) != status_t::SUCCESS ||
-        !device_ptr) {
-      std::cerr << "allocateBuffer failed, size=" << src_size << std::endl;
-      break;
-    }
-    if (gpu_mem_op->copyHostToDevice(device_ptr, host_data.data(), src_size) !=
-        status_t::SUCCESS) {
-      std::cerr << "copyHostToDevice failed, size=" << src_size << std::endl;
-      gpu_mem_op->freeBuffer(device_ptr);
-      break;
+    if (mode != "write_cpu") {
+      if (gpu_mem_op->allocateBuffer(&device_ptr, src_size) != status_t::SUCCESS ||
+          !device_ptr) {
+        std::cerr << "allocateBuffer failed, size=" << src_size << std::endl;
+        break;
+      }
+      if (gpu_mem_op->copyHostToDevice(device_ptr, host_data.data(), src_size) !=
+          status_t::SUCCESS) {
+        std::cerr << "copyHostToDevice failed, size=" << src_size << std::endl;
+        gpu_mem_op->freeBuffer(device_ptr);
+        break;
+      }
     }
 
     Context ctx = {.cpu_data_ptr = host_data.data(),
@@ -475,7 +486,7 @@ int main(int argc, char *argv[]) {
     if (!g_last_transfer_ok || total_time <= 0) {
       std::cerr << "[Mode: " << mode << "] transfer failed at size="
                 << total_size << " B" << std::endl;
-      gpu_mem_op->freeBuffer(device_ptr);
+      if (device_ptr) gpu_mem_op->freeBuffer(device_ptr);
       break;
     }
 
@@ -498,7 +509,7 @@ int main(int argc, char *argv[]) {
       file.close();
     }
 
-    gpu_mem_op->freeBuffer(device_ptr);
+    if (device_ptr) gpu_mem_op->freeBuffer(device_ptr);
     std::this_thread::sleep_for(std::chrono::seconds(2));
   }
 
