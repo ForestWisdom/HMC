@@ -206,6 +206,20 @@ PYBIND11_MODULE(hmc, m) {
            py::arg("local_off"), py::arg("remote_off"), py::arg("size"),
            py::arg("connType") = hmc::ConnType::RDMA)
 
+      .def("putPipeline", &hmc::Communicator::putPipeline,
+           py::arg("ip"), py::arg("port"),
+           py::arg("local_off"), py::arg("remote_off"), py::arg("size"),
+           py::arg("chunk_size") = 0,
+           py::arg("max_inflight") = 64,
+           py::arg("connType") = hmc::ConnType::RDMA)
+
+      .def("getPipeline", &hmc::Communicator::getPipeline,
+           py::arg("ip"), py::arg("port"),
+           py::arg("local_off"), py::arg("remote_off"), py::arg("size"),
+           py::arg("chunk_size") = 0,
+           py::arg("max_inflight") = 64,
+           py::arg("connType") = hmc::ConnType::RDMA)
+
       // NB ops: return (status, wr_id) to Python
       .def("putNB",
            [](hmc::Communicator &self,

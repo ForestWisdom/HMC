@@ -5,26 +5,63 @@
  */
 
 #include "net_rdma.h"
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include <unordered_set>
 
 namespace hmc {
+
+namespace {
+
+uint32_t envU32OrDefault(const char *name, uint32_t defv) {
+  const char *v = std::getenv(name);
+  if (!v || !*v) return defv;
+  char *end = nullptr;
+  errno = 0;
+  unsigned long out = std::strtoul(v, &end, 10);
+  if (errno != 0 || end == v || *end != '\0') return defv;
+  if (out > std::numeric_limits<uint32_t>::max()) return defv;
+  return static_cast<uint32_t>(out);
+}
+
+ibv_mtu mtuFromIntOrDefault(uint32_t mtu, ibv_mtu defv) {
+  switch (mtu) {
+  case 256:
+    return IBV_MTU_256;
+  case 512:
+    return IBV_MTU_512;
+  case 1024:
+    return IBV_MTU_1024;
+  case 2048:
+    return IBV_MTU_2048;
+  case 4096:
+    return IBV_MTU_4096;
+  default:
+    return defv;
+  }
+}
+
+} // namespace
 
 /* -------------------------------------------------------------------------- */
 /*                          RDMAEndpoint Lifecycle                            */
 /* -------------------------------------------------------------------------- */
 
 RDMAEndpoint::RDMAEndpoint(std::shared_ptr<ConnBuffer> buffer, size_t num_qps)
-    : buffer(buffer), num_qps_(num_qps) {}
+    : buffer(buffer), num_qps_(num_qps) {
+  const uint32_t env_cq = envU32OrDefault("HMC_RDMA_CQ_CAPACITY", cq_capacity);
+  const uint32_t env_wr = envU32OrDefault("HMC_RDMA_MAX_WR", max_wr);
+  cq_capacity = static_cast<uint16_t>(std::max<uint32_t>(16, std::min<uint32_t>(env_cq, 65535)));
+  max_wr = static_cast<uint16_t>(std::max<uint32_t>(16, std::min<uint32_t>(env_wr, 65535)));
+}
 
 RDMAEndpoint::~RDMAEndpoint() {
   if (role == EndpointType::Client && connStatus == status_t::SUCCESS) {
     closeEndpoint(); // only client actively closes
   }
   cleanRdmaResources();
-  if (qp_load_) {
-    delete[] qp_load_;
-    qp_load_ = nullptr;
-  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -38,12 +75,6 @@ status_t RDMAEndpoint::setupQPs() {
   }
 
   qps_.resize(num_qps_);
-  
-  if (qp_load_) delete[] qp_load_;
-  qp_load_ = new size_t[num_qps_];
-  for (size_t i = 0; i < num_qps_; ++i) {
-    qp_load_[i] = 0;
-  }
 
   memset(&qp_init_attr, 0, sizeof(qp_init_attr));
   qp_init_attr.qp_type = IBV_QPT_RC;
@@ -79,22 +110,6 @@ status_t RDMAEndpoint::setupQPs() {
   return status_t::SUCCESS;
 }
 
-size_t RDMAEndpoint::getLeastLoadedQP() {
-  if (num_qps_ <= 1 || !qp_load_) return 0;
-  
-  size_t min_load = SIZE_MAX;
-  size_t best_qp = 0;
-  
-  for (size_t i = 0; i < num_qps_; ++i) {
-    size_t load = qp_load_[i];
-    if (load < min_load) {
-      min_load = load;
-      best_qp = i;
-    }
-  }
-  return best_qp;
-}
-
 ibv_qp *RDMAEndpoint::getQP(size_t idx) {
   if (num_qps_ == 0 || qps_.empty()) {
     logError("getQP: QP not initialized");
@@ -106,6 +121,17 @@ ibv_qp *RDMAEndpoint::getQP(size_t idx) {
 
 status_t RDMAEndpoint::transitionExtraQPsToRTS() {
   if (num_qps_ <= 1) return status_t::SUCCESS;
+
+  ibv_mtu path_mtu = IBV_MTU_1024;
+  if (pd && pd->context) {
+    ibv_port_attr pattr{};
+    if (ibv_query_port(pd->context, port_num_, &pattr) == 0) {
+      path_mtu = pattr.active_mtu;
+    }
+  }
+  path_mtu = mtuFromIntOrDefault(
+      envU32OrDefault("HMC_RDMA_PATH_MTU", static_cast<uint32_t>(path_mtu)),
+      path_mtu);
 
   for (size_t i = 1; i < num_qps_; ++i) {
     ibv_qp* qp = qps_[i];
@@ -133,7 +159,7 @@ status_t RDMAEndpoint::transitionExtraQPsToRTS() {
     {
       ibv_qp_attr attr{};
       attr.qp_state           = IBV_QPS_RTR;
-      attr.path_mtu           = IBV_MTU_1024;
+      attr.path_mtu           = path_mtu;
       attr.dest_qp_num        = remote_metadata_attr.qp_num_list[i];
       attr.rq_psn             = 0;
       attr.max_dest_rd_atomic = 1;
@@ -246,36 +272,7 @@ status_t RDMAEndpoint::writeData(size_t local_off, size_t remote_off, size_t siz
 
 status_t RDMAEndpoint::writeDataNB(size_t local_off, size_t remote_off, size_t size,
                                   uint64_t *wr_id) {
-  if (!wr_id) return status_t::ERROR;
-
-  if (local_off + size > buffer->buffer_size) {
-    logError("writeDataNB: local range invalid, local_off=%zu size=%zu buf=%zu",
-             local_off, size, buffer->buffer_size);
-    return status_t::ERROR;
-  }
-  if (remote_off + size > (size_t)remote_metadata_attr.length) {
-    logError("writeDataNB: remote range invalid, remote_off=%zu size=%zu remote_len=%u",
-             remote_off, size, remote_metadata_attr.length);
-    return status_t::ERROR;
-  }
-
-  void *localAddr  = static_cast<char *>(buffer->ptr) + local_off;
-  void *remoteAddr = reinterpret_cast<char *>(remote_metadata_attr.address) + remote_off;
-
-  *wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
-  
-  size_t qp_idx;
-  if (num_qps_ > 1 && qp_load_) {
-    qp_idx = getLeastLoadedQP();
-    qp_load_[qp_idx]++;
-  } else {
-    qp_idx = 0;
-  }
-
-  *wr_id = (*wr_id << 8) | qp_idx;  // Encode QP index in lower 8 bits
-
-  return postWrite(localAddr, remoteAddr, size, buffer_mr,
-                   remote_metadata_attr.key, *wr_id, /*signaled=*/true, qp_idx);
+  return writeDataNBInternal(local_off, remote_off, size, wr_id, /*signaled=*/true);
 }
 
 status_t RDMAEndpoint::readData(size_t local_off, size_t remote_off, size_t size) {
@@ -306,36 +303,87 @@ status_t RDMAEndpoint::readData(size_t local_off, size_t remote_off, size_t size
 
 status_t RDMAEndpoint::readDataNB(size_t local_off, size_t remote_off, size_t size,
                                  uint64_t *wr_id) {
+  return readDataNBInternal(local_off, remote_off, size, wr_id, /*signaled=*/true);
+}
+
+status_t RDMAEndpoint::writeDataNBInternal(size_t local_off, size_t remote_off, size_t size,
+                                           uint64_t *wr_id, bool signaled) {
   if (!wr_id) return status_t::ERROR;
+  *wr_id = 0;
+
+  if (local_off + size > buffer->buffer_size) {
+    logError("writeDataNB: local range invalid, local_off=%zu size=%zu buf=%zu",
+             local_off, size, buffer->buffer_size);
+    return status_t::ERROR;
+  }
+  if (remote_off + size > static_cast<size_t>(remote_metadata_attr.length)) {
+    logError("writeDataNB: remote range invalid, remote_off=%zu size=%zu remote_len=%u",
+             remote_off, size, remote_metadata_attr.length);
+    return status_t::ERROR;
+  }
+
+  void *localAddr = static_cast<char *>(buffer->ptr) + local_off;
+  void *remoteAddr = reinterpret_cast<char *>(remote_metadata_attr.address) + remote_off;
+
+  size_t qp_idx = 0;
+  if (num_qps_ > 1) {
+    qp_idx = static_cast<size_t>(
+        next_qp_idx_.fetch_add(1, std::memory_order_relaxed) % num_qps_);
+  }
+
+  uint64_t id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
+  id = (id << 8) | qp_idx; // encode QP index in low bits
+
+  status_t st = postWrite(localAddr, remoteAddr, size, buffer_mr,
+                          remote_metadata_attr.key, id, signaled, qp_idx);
+  if (st != status_t::SUCCESS) {
+    return st;
+  }
+
+  if (signaled) {
+    *wr_id = id;
+  }
+  return status_t::SUCCESS;
+}
+
+status_t RDMAEndpoint::readDataNBInternal(size_t local_off, size_t remote_off, size_t size,
+                                          uint64_t *wr_id, bool signaled) {
+  if (!wr_id) return status_t::ERROR;
+  *wr_id = 0;
 
   if (local_off + size > buffer->buffer_size) {
     logError("readDataNB: local range invalid, local_off=%zu size=%zu buf=%zu",
              local_off, size, buffer->buffer_size);
     return status_t::ERROR;
   }
-  if (remote_off + size > (size_t)remote_metadata_attr.length) {
+  if (remote_off + size > static_cast<size_t>(remote_metadata_attr.length)) {
     logError("readDataNB: remote range invalid, remote_off=%zu size=%zu remote_len=%u",
              remote_off, size, remote_metadata_attr.length);
     return status_t::ERROR;
   }
 
-  void *localAddr  = static_cast<char *>(buffer->ptr) + local_off;
+  void *localAddr = static_cast<char *>(buffer->ptr) + local_off;
   void *remoteAddr = reinterpret_cast<char *>(remote_metadata_attr.address) + remote_off;
 
-  *wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
-  
-  size_t qp_idx;
-  if (num_qps_ > 1 && qp_load_) {
-    qp_idx = getLeastLoadedQP();
-    qp_load_[qp_idx]++;
-  } else {
-    qp_idx = 0;
+  size_t qp_idx = 0;
+  if (num_qps_ > 1) {
+    qp_idx = static_cast<size_t>(
+        next_qp_idx_.fetch_add(1, std::memory_order_relaxed) % num_qps_);
   }
 
-  *wr_id = (*wr_id << 8) | qp_idx;  // Encode QP index in lower 8 bits
+  uint64_t id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
+  id = (id << 8) | qp_idx;
 
-  return postRead(localAddr, remoteAddr, size, buffer_mr,
-                  remote_metadata_attr.key, *wr_id, /*signaled=*/true, qp_idx);
+  status_t st = postRead(localAddr, remoteAddr, size, buffer_mr,
+                         remote_metadata_attr.key, id, signaled, qp_idx);
+  if (st != status_t::SUCCESS) {
+    return st;
+  }
+
+  if (signaled) {
+    *wr_id = id;
+  }
+  return status_t::SUCCESS;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -354,33 +402,59 @@ status_t RDMAEndpoint::writeDataPipeline(size_t local_off, size_t remote_off, si
   }
 
   if (chunk_size == 0) {
-    chunk_size = 4 * 1024 * 1024;  // 4MB default chunk
+    chunk_size = static_cast<size_t>(
+        envU32OrDefault("HMC_RDMA_PIPELINE_CHUNK", 4 * 1024 * 1024));
   }
+  if (chunk_size == 0) chunk_size = 4 * 1024 * 1024;
+
+  if (max_inflight == 0) {
+    max_inflight = static_cast<size_t>(
+        envU32OrDefault("HMC_RDMA_PIPELINE_INFLIGHT", std::max<uint32_t>(32, max_wr / 2)));
+  }
+  if (max_inflight == 0) max_inflight = 32;
+
+  size_t signal_interval = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_RDMA_PIPELINE_SIGNAL_INTERVAL", 16)));
+  signal_interval = std::min(signal_interval, max_inflight);
 
   const size_t num_chunks = (size + chunk_size - 1) / chunk_size;
   std::vector<uint64_t> pending_wrs;
-  pending_wrs.reserve(num_chunks);
+  pending_wrs.reserve(std::min(num_chunks, max_inflight));
 
   size_t offset = 0;
+  size_t inflight_posts = 0;
+  size_t since_last_signal = 0;
 
   while (offset < size) {
     const size_t current_chunk_size = std::min(chunk_size, size - offset);
+    const bool is_last = (offset + current_chunk_size) >= size;
+    const bool signaled = (signal_interval <= 1) || is_last ||
+                          ((since_last_signal + 1) >= signal_interval);
 
     uint64_t wr_id;
-    if (writeDataNB(local_off + offset, remote_off + offset, current_chunk_size, &wr_id) 
+    if (writeDataNBInternal(local_off + offset, remote_off + offset, current_chunk_size, &wr_id, signaled)
         != status_t::SUCCESS) {
       logError("writeDataPipeline: writeDataNB failed at offset %zu", offset);
       return status_t::ERROR;
     }
-    pending_wrs.push_back(wr_id);
-    offset += current_chunk_size;
 
-    if (pending_wrs.size() >= max_inflight || offset >= size) {
-      if (waitWrIdMulti(pending_wrs) != status_t::SUCCESS) {
-        logError("writeDataPipeline: waitWrIdMulti failed");
+    if (signaled && wr_id != 0) {
+      pending_wrs.push_back(wr_id);
+      since_last_signal = 0;
+    } else {
+      since_last_signal++;
+    }
+
+    offset += current_chunk_size;
+    inflight_posts++;
+
+    if (inflight_posts >= max_inflight || is_last) {
+      if (!pending_wrs.empty() && waitWrIdMulti(pending_wrs) != status_t::SUCCESS) {
+        logError("writeDataPipeline: waitWrIdMulti failed (pending=%zu)", pending_wrs.size());
         return status_t::ERROR;
       }
       pending_wrs.clear();
+      inflight_posts = 0;
     }
   }
 
@@ -388,7 +462,7 @@ status_t RDMAEndpoint::writeDataPipeline(size_t local_off, size_t remote_off, si
 }
 
 status_t RDMAEndpoint::readDataPipeline(size_t local_off, size_t remote_off, size_t size,
-                                        size_t chunk_size, size_t max_inflight) {
+                                       size_t chunk_size, size_t max_inflight) {
   if (local_off + size > buffer->buffer_size) {
     logError("readDataPipeline: local range invalid");
     return status_t::ERROR;
@@ -399,33 +473,59 @@ status_t RDMAEndpoint::readDataPipeline(size_t local_off, size_t remote_off, siz
   }
 
   if (chunk_size == 0) {
-    chunk_size = 4 * 1024 * 1024;  // 4MB default chunk
+    chunk_size = static_cast<size_t>(
+        envU32OrDefault("HMC_RDMA_PIPELINE_CHUNK", 4 * 1024 * 1024));
   }
+  if (chunk_size == 0) chunk_size = 4 * 1024 * 1024;
+
+  if (max_inflight == 0) {
+    max_inflight = static_cast<size_t>(
+        envU32OrDefault("HMC_RDMA_PIPELINE_INFLIGHT", std::max<uint32_t>(32, max_wr / 2)));
+  }
+  if (max_inflight == 0) max_inflight = 32;
+
+  size_t signal_interval = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_RDMA_PIPELINE_SIGNAL_INTERVAL", 16)));
+  signal_interval = std::min(signal_interval, max_inflight);
 
   const size_t num_chunks = (size + chunk_size - 1) / chunk_size;
   std::vector<uint64_t> pending_wrs;
-  pending_wrs.reserve(num_chunks);
+  pending_wrs.reserve(std::min(num_chunks, max_inflight));
 
   size_t offset = 0;
+  size_t inflight_posts = 0;
+  size_t since_last_signal = 0;
 
   while (offset < size) {
     const size_t current_chunk_size = std::min(chunk_size, size - offset);
+    const bool is_last = (offset + current_chunk_size) >= size;
+    const bool signaled = (signal_interval <= 1) || is_last ||
+                          ((since_last_signal + 1) >= signal_interval);
 
     uint64_t wr_id;
-    if (readDataNB(local_off + offset, remote_off + offset, current_chunk_size, &wr_id) 
+    if (readDataNBInternal(local_off + offset, remote_off + offset, current_chunk_size, &wr_id, signaled)
         != status_t::SUCCESS) {
       logError("readDataPipeline: readDataNB failed at offset %zu", offset);
       return status_t::ERROR;
     }
-    pending_wrs.push_back(wr_id);
-    offset += current_chunk_size;
 
-    if (pending_wrs.size() >= max_inflight || offset >= size) {
-      if (waitWrIdMulti(pending_wrs) != status_t::SUCCESS) {
-        logError("readDataPipeline: waitWrIdMulti failed");
+    if (signaled && wr_id != 0) {
+      pending_wrs.push_back(wr_id);
+      since_last_signal = 0;
+    } else {
+      since_last_signal++;
+    }
+
+    offset += current_chunk_size;
+    inflight_posts++;
+
+    if (inflight_posts >= max_inflight || is_last) {
+      if (!pending_wrs.empty() && waitWrIdMulti(pending_wrs) != status_t::SUCCESS) {
+        logError("readDataPipeline: waitWrIdMulti failed (pending=%zu)", pending_wrs.size());
         return status_t::ERROR;
       }
       pending_wrs.clear();
+      inflight_posts = 0;
     }
   }
 
@@ -438,19 +538,38 @@ status_t RDMAEndpoint::readDataPipeline(size_t local_off, size_t remote_off, siz
 
 status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
                                 MemoryType mem_type) {
-  status_t ret;
+  if (send_flags == 0) return status_t::SUCCESS;
+  if (!input_buffer) return status_t::ERROR;
 
   const size_t half_buffer_size = buffer->buffer_size / 2;
-  const size_t num_send_chunks =
-      (send_flags + half_buffer_size - 1) / half_buffer_size;
+  if (half_buffer_size == 0) {
+    logError("Client::Send: invalid half buffer size 0");
+    return status_t::ERROR;
+  }
+  if (send_flags > std::numeric_limits<UHM_STATE_TYPE>::max()) {
+    logError("Client::Send: send size %zu exceeds UHM_STATE_TYPE limit", send_flags);
+    return status_t::ERROR;
+  }
+
+  size_t chunk_size = static_cast<size_t>(
+      envU32OrDefault("HMC_UHM_CHUNK", static_cast<uint32_t>(half_buffer_size)));
+  chunk_size = std::max<size_t>(1, std::min(chunk_size, half_buffer_size));
+  size_t signal_interval = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_SIGNAL_INTERVAL", 16)));
+  size_t max_pending_signal = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_PENDING_SIGNAL", 8)));
+
+  const size_t num_send_chunks = (send_flags + chunk_size - 1) / chunk_size;
   size_t current_chunk = 0;
   size_t chunk_index = 0;
-  size_t send_size = std::min(half_buffer_size, send_flags);
+  size_t send_size = std::min(chunk_size, send_flags);
+  status_t ret;
 
   // set flags
   uhm_buffer_state.state[0] = UHM_BUFFER_CAN_WRITE;
   uhm_buffer_state.state[1] = UHM_BUFFER_CAN_WRITE;
-  uhm_buffer_state.length = send_flags;
+  uhm_buffer_state.length = static_cast<UHM_STATE_TYPE>(send_flags);
+  uhm_buffer_state.chunk_bytes = static_cast<UHM_STATE_TYPE>(chunk_size);
 
   // write buffer_state (use qp 0 for flag bootstrap)
   void *localAddr = reinterpret_cast<char *>(&uhm_buffer_state);
@@ -466,21 +585,26 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
   }
 
   // pre-fill first half buffer
+  void *first_src = static_cast<char *>(input_buffer);
   mem_type == MemoryType::CPU
-      ? buffer->writeFromCpu(input_buffer, send_size, 0)
-      : buffer->writeFromGpu(input_buffer, send_size, 0);
+      ? buffer->writeFromCpu(first_src, send_size, 0)
+      : buffer->writeFromGpu(first_src, send_size, 0);
 
   if (waitWrId(wr_id) != status_t::SUCCESS) {
     logError("Client::Send: Failed to poll completion for state write");
     return status_t::ERROR;
   }
 
+  std::vector<uint64_t> pending_signaled;
+  pending_signaled.reserve(max_pending_signal);
+  size_t since_last_signal = 0;
+  const int SPIN_COUNT = 100;
+
   while (current_chunk < num_send_chunks) {
     chunk_index = current_chunk % 2;
     size_t next_chunk_index = (current_chunk + 1) % 2;
 
     // spin until remote allows write on this half
-    const int SPIN_COUNT = 100;
     while (uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_WRITE) {
       int spin = 0;
       while (spin++ < SPIN_COUNT &&
@@ -497,19 +621,22 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
     }
 
     // this chunk size
-    size_t remaining = send_flags - current_chunk * half_buffer_size;
-    send_size = std::min(half_buffer_size, remaining);
+    size_t remaining = send_flags - current_chunk * chunk_size;
+    send_size = std::min(chunk_size, remaining);
+    const bool is_last = (current_chunk + 1) >= num_send_chunks;
+    const bool signal_flag = (signal_interval <= 1) || is_last ||
+                             ((since_last_signal + 1) >= signal_interval);
 
     // choose qp for this chunk to keep ordering between data and flag
-    size_t qp_idx = current_chunk % num_qps_;
+    size_t qp_idx = current_chunk % std::max<size_t>(num_qps_, 1);
 
-    // post data write
+    // post data write unsignaled; completion is tracked by flag write.
     void *data_local = static_cast<char *>(buffer->ptr) + chunk_index * half_buffer_size;
     void *data_remote =
         reinterpret_cast<char *>(remote_metadata_attr.address) + chunk_index * half_buffer_size;
-    wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t data_wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
     ret = postWrite(data_local, data_remote, send_size, buffer_mr,
-                    remote_metadata_attr.key, wr_id, true, qp_idx);
+                    remote_metadata_attr.key, data_wr_id, false, qp_idx);
     if (ret != status_t::SUCCESS) {
       logError("Client::Send: Failed to post write data for chunk %zu",
                current_chunk);
@@ -523,33 +650,50 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
     void *flag_remote =
         reinterpret_cast<char *>(remote_metadata_attr.uhm_buffer_state_address) +
         chunk_index * sizeof(UHM_STATE_TYPE);
+    uint64_t flag_wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
     ret = postWrite(flag_local, flag_remote, sizeof(UHM_STATE_TYPE),
                     uhm_buffer_state_mr,
-                    remote_metadata_attr.uhm_buffer_state_key, wr_id, true, qp_idx);
+                    remote_metadata_attr.uhm_buffer_state_key,
+                    flag_wr_id, signal_flag, qp_idx);
     if (ret != status_t::SUCCESS) {
       logError("Client::Send: Failed to post write buffer state");
       return ret;
     }
+    if (signal_flag) {
+      pending_signaled.push_back(flag_wr_id);
+      since_last_signal = 0;
+    } else {
+      since_last_signal++;
+    }
 
     // pre-fill next half if any
     if (current_chunk + 1 < num_send_chunks) {
-      size_t next_remaining =
-          send_flags - (current_chunk + 1) * half_buffer_size;
-      size_t next_size = std::min(half_buffer_size, next_remaining);
+      size_t next_remaining = send_flags - (current_chunk + 1) * chunk_size;
+      size_t next_size = std::min(chunk_size, next_remaining);
       size_t bias = next_chunk_index * half_buffer_size;
+      void *next_src = static_cast<char *>(input_buffer) +
+                       (current_chunk + 1) * chunk_size;
       mem_type == MemoryType::CPU
-          ? buffer->writeFromCpu(input_buffer, next_size, bias)
-          : buffer->writeFromGpu(input_buffer, next_size, bias);
+          ? buffer->writeFromCpu(next_src, next_size, bias)
+          : buffer->writeFromGpu(next_src, next_size, bias);
     }
 
-    // wait completion for data+flag
-    if (waitWrId(wr_id) != status_t::SUCCESS) {
-      logError("Client::Send: Failed to poll completion for chunk %zu",
-               current_chunk);
-      return status_t::ERROR;
+    if (pending_signaled.size() >= max_pending_signal) {
+      if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+        logError("Client::Send: waitWrIdMulti failed for signaled flags");
+        return status_t::ERROR;
+      }
+      pending_signaled.clear();
     }
 
     current_chunk++;
+  }
+
+  if (!pending_signaled.empty()) {
+    if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+      logError("Client::Send: final waitWrIdMulti failed");
+      return status_t::ERROR;
+    }
   }
 
   return status_t::SUCCESS;
@@ -557,6 +701,7 @@ status_t RDMAEndpoint::uhm_send(void *input_buffer, const size_t send_flags,
 
 status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
                                 size_t *recv_flags, MemoryType mem_type) {
+  if (!output_buffer || !recv_flags) return status_t::ERROR;
   status_t ret;
   size_t current_chunk = 0;
   size_t chunk_index = 0;
@@ -564,11 +709,17 @@ status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
   size_t recv_size = 0;
   const size_t half_buffer_size = buffer->buffer_size / 2;
   size_t num_recv_chunks = 0;
+  size_t recv_chunk_size = half_buffer_size;
+  if (half_buffer_size == 0) {
+    logError("Server::Recv: invalid half buffer size 0");
+    return status_t::ERROR;
+  }
 
   // init states so sender can see we're ready
   uhm_buffer_state.state[0] = UHM_BUFFER_CAN_READ;
   uhm_buffer_state.state[1] = UHM_BUFFER_CAN_READ;
   uhm_buffer_state.length = 0;
+  uhm_buffer_state.chunk_bytes = 0;
 
   // wait for length + initial states
   const int SPIN_COUNT = 100;
@@ -580,7 +731,10 @@ status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
         logError("Server::Recv: Invalid receive size is 0");
         return status_t::ERROR;
       }
-      num_recv_chunks = (*recv_flags + half_buffer_size - 1) / half_buffer_size;
+      recv_chunk_size = static_cast<size_t>(tmp.chunk_bytes);
+      if (recv_chunk_size == 0) recv_chunk_size = half_buffer_size;
+      recv_chunk_size = std::max<size_t>(1, std::min(recv_chunk_size, half_buffer_size));
+      num_recv_chunks = (*recv_flags + recv_chunk_size - 1) / recv_chunk_size;
       this->uhm_buffer_state.state[0] = UHM_BUFFER_CAN_WRITE;
       this->uhm_buffer_state.state[1] = UHM_BUFFER_CAN_WRITE;
       break;
@@ -598,64 +752,102 @@ status_t RDMAEndpoint::uhm_recv(void *output_buffer, const size_t buffer_size,
   }
 
   // receive chunks
-  uint64_t wr_id;
+  size_t signal_interval = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_SIGNAL_INTERVAL", 16)));
+  size_t max_pending_signal = static_cast<size_t>(
+      std::max<uint32_t>(1, envU32OrDefault("HMC_UHM_PENDING_SIGNAL", 8)));
+  std::vector<uint64_t> pending_signaled;
+  pending_signaled.reserve(max_pending_signal);
+  size_t since_last_signal = 0;
+
   while (current_chunk < num_recv_chunks) {
     chunk_index = current_chunk % 2;
     // choose qp for this chunk (for ordering of flag write-back)
-    size_t qp_idx = current_chunk % num_qps_;
+    size_t qp_idx = current_chunk % std::max<size_t>(num_qps_, 1);
 
-    if (this->uhm_buffer_state.state[chunk_index] == UHM_BUFFER_CAN_READ) {
-      // immediately grant write permission back to sender (same QP)
-      this->uhm_buffer_state.state[chunk_index] = UHM_BUFFER_CAN_WRITE;
-      void *flag_local = reinterpret_cast<char *>(&uhm_buffer_state) +
-                         chunk_index * sizeof(UHM_STATE_TYPE);
-      void *flag_remote =
-          reinterpret_cast<char *>(remote_metadata_attr.uhm_buffer_state_address) +
-          chunk_index * sizeof(UHM_STATE_TYPE);
-      wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
-      ret = postWrite(flag_local, flag_remote, sizeof(UHM_STATE_TYPE),
-                      uhm_buffer_state_mr,
-                      remote_metadata_attr.uhm_buffer_state_key, wr_id, true, qp_idx);
-      if (ret != status_t::SUCCESS) {
-        logError("Server::Recv: Failed to post write buffer state");
-        return ret;
+    if (this->uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_READ) {
+      int spin = 0;
+      while (spin++ < SPIN_COUNT &&
+             this->uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_READ) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#endif
       }
-
-      // compute receive size
-      if (current_chunk == num_recv_chunks - 1) {
-        recv_size = *recv_flags - accumulated_size;
-      } else {
-        recv_size = half_buffer_size;
+      if (this->uhm_buffer_state.state[chunk_index] != UHM_BUFFER_CAN_READ) {
+        std::this_thread::yield();
       }
-      // boundary checks
-      if (recv_size == 0) {
-        logError("Server::Recv: Invalid receive size is 0");
-        return status_t::ERROR;
-      } else if (recv_size > buffer_size) {
-        logError("Server::Recv: Invalid receive size %zu > buffer_size %zu",
-                 recv_size, buffer_size);
-        return status_t::ERROR;
-      } else if (accumulated_size + recv_size > buffer_size) {
-        logError("Server::Recv: accumulated_size + recv_size > buffer_size");
-        return status_t::ERROR;
-      }
-
-      // copy to output
-      size_t bias = chunk_index * half_buffer_size;
-      void *dest = static_cast<char *>(output_buffer) + accumulated_size;
-      mem_type == MemoryType::CPU ? buffer->readToCpu(dest, recv_size, bias)
-                                  : buffer->readToGpu(dest, recv_size, bias);
-
-      // ensure flag write completion processed
-      if (waitWrId(wr_id) != status_t::SUCCESS) {
-        logError("Failed to poll completion queue");
-        return status_t::ERROR;
-      }
-
-      accumulated_size += recv_size;
-      current_chunk++;
+      continue;
     }
-  };
+
+    // compute receive size
+    if (current_chunk == num_recv_chunks - 1) {
+      recv_size = *recv_flags - accumulated_size;
+    } else {
+      recv_size = recv_chunk_size;
+    }
+    // boundary checks
+    if (recv_size == 0) {
+      logError("Server::Recv: Invalid receive size is 0");
+      return status_t::ERROR;
+    } else if (recv_size > buffer_size) {
+      logError("Server::Recv: Invalid receive size %zu > buffer_size %zu",
+               recv_size, buffer_size);
+      return status_t::ERROR;
+    } else if (accumulated_size + recv_size > buffer_size) {
+      logError("Server::Recv: accumulated_size + recv_size > buffer_size");
+      return status_t::ERROR;
+    }
+
+    // copy out first, then grant write-back to avoid overwrite race.
+    size_t bias = chunk_index * half_buffer_size;
+    void *dest = static_cast<char *>(output_buffer) + accumulated_size;
+    mem_type == MemoryType::CPU ? buffer->readToCpu(dest, recv_size, bias)
+                                : buffer->readToGpu(dest, recv_size, bias);
+
+    this->uhm_buffer_state.state[chunk_index] = UHM_BUFFER_CAN_WRITE;
+    void *flag_local = reinterpret_cast<char *>(&uhm_buffer_state) +
+                       chunk_index * sizeof(UHM_STATE_TYPE);
+    void *flag_remote =
+        reinterpret_cast<char *>(remote_metadata_attr.uhm_buffer_state_address) +
+        chunk_index * sizeof(UHM_STATE_TYPE);
+    const bool is_last = (current_chunk + 1) >= num_recv_chunks;
+    const bool signal_flag = (signal_interval <= 1) || is_last ||
+                             ((since_last_signal + 1) >= signal_interval);
+    uint64_t flag_wr_id = next_wr_id_.fetch_add(1, std::memory_order_relaxed);
+    ret = postWrite(flag_local, flag_remote, sizeof(UHM_STATE_TYPE),
+                    uhm_buffer_state_mr,
+                    remote_metadata_attr.uhm_buffer_state_key,
+                    flag_wr_id, signal_flag, qp_idx);
+    if (ret != status_t::SUCCESS) {
+      logError("Server::Recv: Failed to post write buffer state");
+      return ret;
+    }
+    if (signal_flag) {
+      pending_signaled.push_back(flag_wr_id);
+      since_last_signal = 0;
+    } else {
+      since_last_signal++;
+    }
+    if (pending_signaled.size() >= max_pending_signal) {
+      if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+        logError("Server::Recv: waitWrIdMulti failed for signaled flags");
+        return status_t::ERROR;
+      }
+      pending_signaled.clear();
+    }
+
+    accumulated_size += recv_size;
+    current_chunk++;
+  }
+
+  if (!pending_signaled.empty()) {
+    if (waitWrIdMulti(pending_signaled) != status_t::SUCCESS) {
+      logError("Server::Recv: final waitWrIdMulti failed");
+      return status_t::ERROR;
+    }
+  }
 
   return status_t::SUCCESS;
 }
@@ -902,18 +1094,6 @@ void RDMAEndpoint::cleanRdmaResources() {
   }
   qps_.clear();
 
-  if (cq) {
-    ibv_destroy_cq(cq);
-    cq = nullptr;
-  }
-  if (pd) {
-    ibv_dealloc_pd(pd);
-    pd = nullptr;
-  }
-  if (completion_channel) {
-    ibv_destroy_comp_channel(completion_channel);
-    completion_channel = nullptr;
-  }
   if (local_metadata_mr) {
     deRegisterMemory(local_metadata_mr);
     local_metadata_mr = nullptr;
@@ -925,6 +1105,22 @@ void RDMAEndpoint::cleanRdmaResources() {
   if (uhm_buffer_state_mr) {
     deRegisterMemory(uhm_buffer_state_mr);
     uhm_buffer_state_mr = nullptr;
+  }
+  if (buffer_mr) {
+    deRegisterMemory(buffer_mr);
+    buffer_mr = nullptr;
+  }
+  if (cq) {
+    ibv_destroy_cq(cq);
+    cq = nullptr;
+  }
+  if (completion_channel) {
+    ibv_destroy_comp_channel(completion_channel);
+    completion_channel = nullptr;
+  }
+  if (pd) {
+    ibv_dealloc_pd(pd);
+    pd = nullptr;
   }
   if (cm_event_channel) {
     rdma_destroy_event_channel(cm_event_channel);
@@ -944,6 +1140,22 @@ status_t RDMAEndpoint::waitWrId(uint64_t target_wr_id) {
   if (!cq) {
     logError("waitForWrId: CQ is null");
     return status_t::ERROR;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(completed_mu_);
+    if (completed_wr_ids_.erase(target_wr_id) > 0) {
+      return status_t::SUCCESS;
+    }
+  }
+
+  std::lock_guard<std::mutex> poll_lk(cq_poll_mu_);
+
+  {
+    std::lock_guard<std::mutex> lk(completed_mu_);
+    if (completed_wr_ids_.erase(target_wr_id) > 0) {
+      return status_t::SUCCESS;
+    }
   }
 
   const int max_wcs = cq_capacity;
@@ -980,13 +1192,11 @@ status_t RDMAEndpoint::waitWrId(uint64_t target_wr_id) {
         return status_t::ERROR;
       }
       if (wcs[i].wr_id == target_wr_id) {
-        if (num_qps_ > 1 && qp_load_) {
-          size_t completed_qp_idx = wcs[i].wr_id & 0xFF;
-          if (completed_qp_idx < num_qps_) {
-            qp_load_[completed_qp_idx]--;
-          }
-        }
         return status_t::SUCCESS;
+      }
+      {
+        std::lock_guard<std::mutex> lk(completed_mu_);
+        completed_wr_ids_.insert(wcs[i].wr_id);
       }
     }
   }
@@ -1007,6 +1217,36 @@ status_t RDMAEndpoint::waitWrIdMulti(const std::vector<uint64_t>& target_wr_ids,
   std::vector<ibv_wc> wcs(max_wcs);
 
   std::unordered_set<uint64_t> pending(target_wr_ids.begin(), target_wr_ids.end());
+  {
+    std::lock_guard<std::mutex> lk(completed_mu_);
+    for (auto it = pending.begin(); it != pending.end();) {
+      if (completed_wr_ids_.erase(*it) > 0) {
+        it = pending.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (pending.empty()) {
+    return status_t::SUCCESS;
+  }
+
+  std::lock_guard<std::mutex> poll_lk(cq_poll_mu_);
+
+  {
+    std::lock_guard<std::mutex> lk(completed_mu_);
+    for (auto it = pending.begin(); it != pending.end();) {
+      if (completed_wr_ids_.erase(*it) > 0) {
+        it = pending.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  if (pending.empty()) {
+    return status_t::SUCCESS;
+  }
+
   auto start_ts   = std::chrono::steady_clock::now();
   auto last_prog  = start_ts;
   size_t last_left = pending.size();
@@ -1036,12 +1276,6 @@ status_t RDMAEndpoint::waitWrIdMulti(const std::vector<uint64_t>& target_wr_ids,
 
         auto it = pending.find(cqe.wr_id);
         if (it != pending.end()) {
-          if (num_qps_ > 1 && qp_load_) {
-            size_t completed_qp_idx = cqe.wr_id & 0xFF;
-            if (completed_qp_idx < num_qps_) {
-              qp_load_[completed_qp_idx]--;
-            }
-          }
           pending.erase(it);
           made_progress = true;
 
@@ -1049,6 +1283,9 @@ status_t RDMAEndpoint::waitWrIdMulti(const std::vector<uint64_t>& target_wr_ids,
             logDebug("waitWrIdMulti: WR %lu done, remaining=%zu", cqe.wr_id, pending.size());
             last_left = pending.size();
           }
+        } else {
+          std::lock_guard<std::mutex> lk(completed_mu_);
+          completed_wr_ids_.insert(cqe.wr_id);
         }
       }
     }

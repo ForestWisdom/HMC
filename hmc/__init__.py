@@ -7,6 +7,11 @@ from typing import Any, Literal, Optional
 
 from . import hmc as _core  # type: ignore
 
+_NUMPY_MODULE = None
+_NUMPY_IMPORT_TRIED = False
+_TORCH_MODULE = None
+_TORCH_IMPORT_TRIED = False
+
 
 class status_t(IntEnum):
     SUCCESS = int(_core.status_t.SUCCESS)
@@ -119,19 +124,29 @@ def _ensure_ok(st: Any, msg: str):
 
 
 def _try_import_numpy():
-    try:
-        import numpy as np  # type: ignore
-        return np
-    except Exception:
-        return None
+    global _NUMPY_MODULE
+    global _NUMPY_IMPORT_TRIED
+    if not _NUMPY_IMPORT_TRIED:
+        _NUMPY_IMPORT_TRIED = True
+        try:
+            import numpy as np  # type: ignore
+            _NUMPY_MODULE = np
+        except Exception:
+            _NUMPY_MODULE = None
+    return _NUMPY_MODULE
 
 
 def _try_import_torch():
-    try:
-        import torch  # type: ignore
-        return torch
-    except Exception:
-        return None
+    global _TORCH_MODULE
+    global _TORCH_IMPORT_TRIED
+    if not _TORCH_IMPORT_TRIED:
+        _TORCH_IMPORT_TRIED = True
+        try:
+            import torch  # type: ignore
+            _TORCH_MODULE = torch
+        except Exception:
+            _TORCH_MODULE = None
+    return _TORCH_MODULE
 
 
 def _to_memoryview(x: Any) -> memoryview:
@@ -604,33 +619,83 @@ class Session:
 
     def put_nb(self, ip: str, port: int, local_off: int, remote_off: int, nbytes: int, conn: ConnType = ConnType.RDMA) -> int:
         p = _require_port(port)
-        wr_id_box = [0]
-        st = self.comm.putNB(
+        st, wr_id = self.comm.putNB(
             str(ip),
             int(p),
             int(local_off),
             int(remote_off),
             int(nbytes),
-            wr_id_box,
             _to_core_conn_type(conn),
         )
         _ensure_ok(st, "Communicator.putNB failed")
-        return int(wr_id_box[0])
+        return int(wr_id)
 
     def get_nb(self, ip: str, port: int, local_off: int, remote_off: int, nbytes: int, conn: ConnType = ConnType.RDMA) -> int:
         p = _require_port(port)
-        wr_id_box = [0]
-        st = self.comm.getNB(
+        st, wr_id = self.comm.getNB(
             str(ip),
             int(p),
             int(local_off),
             int(remote_off),
             int(nbytes),
-            wr_id_box,
             _to_core_conn_type(conn),
         )
         _ensure_ok(st, "Communicator.getNB failed")
-        return int(wr_id_box[0])
+        return int(wr_id)
+
+    def put_pipeline(
+        self,
+        ip: str,
+        port: int,
+        local_off: int,
+        remote_off: int,
+        nbytes: int,
+        *,
+        chunk_size: int = 0,
+        max_inflight: int = 64,
+        conn: ConnType = ConnType.RDMA,
+    ) -> None:
+        p = _require_port(port)
+        _ensure_ok(
+            self.comm.putPipeline(
+                str(ip),
+                int(p),
+                int(local_off),
+                int(remote_off),
+                int(nbytes),
+                int(chunk_size),
+                int(max_inflight),
+                _to_core_conn_type(conn),
+            ),
+            "Communicator.putPipeline failed",
+        )
+
+    def get_pipeline(
+        self,
+        ip: str,
+        port: int,
+        local_off: int,
+        remote_off: int,
+        nbytes: int,
+        *,
+        chunk_size: int = 0,
+        max_inflight: int = 64,
+        conn: ConnType = ConnType.RDMA,
+    ) -> None:
+        p = _require_port(port)
+        _ensure_ok(
+            self.comm.getPipeline(
+                str(ip),
+                int(p),
+                int(local_off),
+                int(remote_off),
+                int(nbytes),
+                int(chunk_size),
+                int(max_inflight),
+                _to_core_conn_type(conn),
+            ),
+            "Communicator.getPipeline failed",
+        )
 
     def wait(self, wr_id: int | list[int]) -> None:
         if isinstance(wr_id, list):

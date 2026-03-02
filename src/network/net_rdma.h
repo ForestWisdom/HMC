@@ -28,6 +28,7 @@
 #include <mutex>
 #include <atomic>
 #include <cstdint>
+#include <unordered_set>
 
 #define MAX_QPS 16
 
@@ -57,6 +58,7 @@ typedef enum {
 struct __attribute__((packed)) UHMBufferState {
   volatile UHM_STATE_TYPE state[2];
   volatile UHM_STATE_TYPE length;
+  volatile UHM_STATE_TYPE chunk_bytes;
 };
 
 struct __attribute__((packed)) rdma_buffer_attr {
@@ -158,11 +160,17 @@ public:
   uint8_t responder_resources = 16;
   uint8_t retry_count = 7;
 
-  size_t getLeastLoadedQP();
-
 private:
+  status_t writeDataNBInternal(size_t local_off, size_t remote_off, size_t size,
+                               uint64_t *wr_id, bool signaled);
+  status_t readDataNBInternal(size_t local_off, size_t remote_off, size_t size,
+                              uint64_t *wr_id, bool signaled);
+
   std::atomic<uint64_t> next_wr_id_{1};
-  size_t* qp_load_ = nullptr;
+  std::atomic<uint32_t> next_qp_idx_{0};
+  std::mutex cq_poll_mu_;
+  std::mutex completed_mu_;
+  std::unordered_set<uint64_t> completed_wr_ids_;
 };
 
 /* -------------------------------- Server -------------------------------- */

@@ -25,7 +25,7 @@ std::string server_ip;
 std::string client_ip;
 std::string tcp_server_ip;
 
-const size_t buffer_size = 1024ULL * 1024 * 128; // max 32 for MLU
+size_t buffer_size = 1024ULL * 1024 * 128; // max 32 for MLU
 const int device_id = 0;
 const int g_port = 2025;
 const int ctrl_port = 2027;
@@ -199,6 +199,7 @@ static size_t pipeline_chunk_size = 4 * 1024 * 1024;
 static size_t pipeline_max_inflight = 64;
 
 void recv_channel_slice_pipeline(Context ctx) {
+  (void)ctx;
   wait_for_control_message(ctrl_socket_fd);
 }
 
@@ -207,7 +208,8 @@ std::string get_mode_from_args(int argc, char *argv[]) {
     if (string(argv[i]) == "--mode" && i + 1 < argc) {
       string mode = argv[i + 1];
       if (mode == "uhm" || mode == "serial" || mode == "g2h2g" ||
-          mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline")
+          mode == "rdma_cpu" || mode == "ucx" || mode == "pipeline" ||
+          mode == "write" || mode == "write_cpu" || mode == "write_stage")
         return mode;
       cerr << "Invalid mode: " << mode << endl;
       exit(1);
@@ -220,9 +222,16 @@ int main(int argc, char *argv[]) {
   std::string mode = get_mode_from_args(argc, argv);
   std::cout << "Running in mode: " << mode << std::endl;
 
-  server_ip = get_env_or_default("SERVER_IP", DEFAULT_SERVER_IP);
-  client_ip = get_env_or_default("CLIENT_IP", DEFAULT_CLIENT_IP);
-  tcp_server_ip = get_env_or_default("TCP_SERVER_IP", DEFAULT_TCP_IP);
+  const std::string default_server_ip =
+      get_env_or_default("DEFAULT_SERVER_IP", DEFAULT_SERVER_IP);
+  const std::string default_client_ip =
+      get_env_or_default("DEFAULT_CLIENT_IP", DEFAULT_CLIENT_IP);
+  const std::string default_tcp_ip =
+      get_env_or_default("DEFAULT_TCP_IP", DEFAULT_TCP_IP);
+
+  server_ip = get_env_or_default("SERVER_IP", default_server_ip);
+  client_ip = get_env_or_default("CLIENT_IP", default_client_ip);
+  tcp_server_ip = get_env_or_default("TCP_SERVER_IP", default_tcp_ip);
 
   self_rank = get_env_u32_or_default("SELF_RANK", 0);
   peer_rank = get_env_u32_or_default("PEER_RANK", 1);
@@ -231,7 +240,16 @@ int main(int argc, char *argv[]) {
 
   std::mutex log_mutex;
 
-  const bool use_cpu_buffer = (mode == "g2h2g" || mode == "ucx");
+  const bool use_cpu_buffer =
+      (mode == "g2h2g" || mode == "ucx" || mode == "write_cpu" ||
+       mode == "write_stage");
+
+  const uint32_t default_buf_mb = use_cpu_buffer ? 128 : 32;
+  uint32_t buf_mb = get_env_u32_or_default("BUFFER_SIZE_MB", default_buf_mb);
+  if (buf_mb == 0) buf_mb = default_buf_mb;
+  buffer_size = static_cast<size_t>(buf_mb) * 1024ULL * 1024ULL;
+  std::cout << "ConnBuffer size: " << (buffer_size / 1024 / 1024) << "MB"
+            << std::endl;
 
   if (use_cpu_buffer) {
     buffer = std::make_shared<ConnBuffer>(0, buffer_size, MemoryType::CPU);
@@ -243,7 +261,8 @@ int main(int argc, char *argv[]) {
   int num_channels = get_env_u32_or_default("NUM_CHANNELS", 1);
   std::cout << "Using " << num_channels << " QPs" << std::endl;
 
-  if (mode == "pipeline") {
+  if (mode == "pipeline" || mode == "write" || mode == "write_cpu" ||
+      mode == "write_stage") {
     pipeline_chunk_size = get_env_u32_or_default("PIPELINE_CHUNK", 4 * 1024 * 1024);
     pipeline_max_inflight = get_env_u32_or_default("PIPELINE_INFLIGHT", 64);
     std::cout << "Pipeline: chunk=" << (pipeline_chunk_size / 1024 / 1024) 
@@ -289,40 +308,62 @@ int main(int argc, char *argv[]) {
     recv_func = recv_channel_slice_rdma_cpu;
   else if (mode == "ucx")
     recv_func = recv_channel_slice_ucx;
-  else if (mode == "pipeline")
+  else if (mode == "pipeline" || mode == "write" || mode == "write_cpu" ||
+           mode == "write_stage")
     recv_func = recv_channel_slice_pipeline;
   else
     recv_func = recv_channel_slice_uhm;
 
-  for (int power = 5; power <= 26; ++power) {
+  int min_power = static_cast<int>(get_env_u32_or_default("MIN_POWER", 5));
+  int max_power = static_cast<int>(get_env_u32_or_default(
+      "MAX_POWER",
+      (mode == "write" || mode == "pipeline" || mode == "write_cpu" ||
+       mode == "write_stage") ? 29 : 26));
+  if (min_power < 1) min_power = 1;
+  if (max_power < min_power) max_power = min_power;
+
+  for (int power = min_power; power <= max_power; ++power) {
     size_t total_size = size_t(1) << power;
-    std::vector<uint8_t> host_data(total_size, 0);
+    const bool verify_from_buffer =
+        (mode == "g2h2g" || mode == "pipeline" || mode == "write" ||
+         mode == "write_cpu" || mode == "write_stage");
+    const size_t buffer_window =
+        (buffer && buffer->buffer_size > 0) ? buffer->buffer_size : buffer_size;
+    size_t check_size = verify_from_buffer ? std::min(total_size, buffer_window)
+                                           : total_size;
+    std::vector<uint8_t> host_data(check_size, 0);
 
     void *gpu_ptr = nullptr;
-    gpu_mem_op->allocateBuffer(&gpu_ptr, total_size);
+    if (!verify_from_buffer) {
+      if (gpu_mem_op->allocateBuffer(&gpu_ptr, total_size) != status_t::SUCCESS ||
+          !gpu_ptr) {
+        std::cerr << "allocateBuffer failed, size=" << total_size << std::endl;
+        break;
+      }
+    }
 
     Context ctx = {host_data.data(), gpu_ptr, total_size, &log_mutex};
     recv_func(ctx);
 
     if (mode == "rdma_cpu") {
-      gpu_mem_op->freeBuffer(gpu_ptr);
+      if (gpu_ptr) gpu_mem_op->freeBuffer(gpu_ptr);
       std::this_thread::sleep_for(std::chrono::seconds(1));
       std::cout << "--------------------------------------------"
                 << std::endl;
       continue;
     }
 
-    if (mode == "g2h2g") {
-      if (buffer->readToCpu(host_data.data(), total_size, 0) !=
+    if (verify_from_buffer) {
+      if (buffer->readToCpu(host_data.data(), check_size, 0) !=
           status_t::SUCCESS) {
-        std::cerr << "[G2H2G] readToCpu failed." << std::endl;
+        std::cerr << "[" << mode << "] readToCpu failed." << std::endl;
       }
     } else {
-      gpu_mem_op->copyDeviceToHost(host_data.data(), gpu_ptr, total_size);
+      gpu_mem_op->copyDeviceToHost(host_data.data(), gpu_ptr, check_size);
     }
 
     bool valid = true;
-    for (size_t i = 0; i < std::min<size_t>(10, total_size); ++i) {
+    for (size_t i = 0; i < std::min<size_t>(10, check_size); ++i) {
       if (host_data[i] != 'A') {
         valid = false;
         break;
@@ -332,7 +373,7 @@ int main(int argc, char *argv[]) {
     std::cout << "[Size " << total_size << " B] Data Integrity: "
               << (valid ? "PASS" : "FAIL") << std::endl;
 
-    gpu_mem_op->freeBuffer(gpu_ptr);
+    if (gpu_ptr) gpu_mem_op->freeBuffer(gpu_ptr);
     std::this_thread::sleep_for(std::chrono::seconds(1));
     std::cout << "--------------------------------------------" << std::endl;
   }
