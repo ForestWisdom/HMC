@@ -356,6 +356,18 @@ void send_channel_slice_write_stage(Context ctx) {
   slots = std::max<size_t>(1, slots);
   std::vector<uint64_t> inflight(slots, 0);
   const size_t src_window = std::max<size_t>(1, std::min(ctx.size, stage_src_window));
+  auto wait_one = [&](uint64_t wr_id, size_t slot, const char *phase) -> bool {
+    if (wr_id == 0) return true;
+    std::vector<uint64_t> ids{wr_id};
+    auto st = comm->wait(ids); // uses waitWrIdMulti with timeout
+    if (st != status_t::SUCCESS) {
+      std::lock_guard<std::mutex> lock(*ctx.log_mutex);
+      std::cerr << "[WriteStage] wait failed (" << phase << "), slot=" << slot
+                << ", wr_id=" << wr_id << ", status=" << (int)st << std::endl;
+      return false;
+    }
+    return true;
+  };
 
   auto start = steady_clock_t::now();
   size_t sent = 0;
@@ -367,9 +379,7 @@ void send_channel_slice_write_stage(Context ctx) {
     const size_t step = std::min(chunk, ctx.size - sent);
 
     if (inflight[slot] != 0) {
-      if (comm->wait(inflight[slot]) != status_t::SUCCESS) {
-        std::lock_guard<std::mutex> lock(*ctx.log_mutex);
-        std::cerr << "[WriteStage] wait failed, slot=" << slot << std::endl;
+      if (!wait_one(inflight[slot], slot, "reuse_slot")) {
         send_control_message("Finished");
         return;
       }
@@ -402,9 +412,7 @@ void send_channel_slice_write_stage(Context ctx) {
 
   for (size_t i = 0; i < inflight.size(); ++i) {
     if (inflight[i] != 0) {
-      if (comm->wait(inflight[i]) != status_t::SUCCESS) {
-        std::lock_guard<std::mutex> lock(*ctx.log_mutex);
-        std::cerr << "[WriteStage] final wait failed, slot=" << i << std::endl;
+      if (!wait_one(inflight[i], i, "final_drain")) {
         send_control_message("Finished");
         return;
       }
@@ -484,11 +492,16 @@ int main(int argc, char *argv[]) {
 
   if (use_cpu_buffer) {
     buffer = std::make_shared<ConnBuffer>(0, buffer_size, MemoryType::CPU);
-    gpu_buffer = std::make_shared<ConnBuffer>(device_id, buffer_size,
-                                              MemoryType::DEFAULT);
+    if (mode == "ucx") {
+      gpu_buffer = std::make_shared<ConnBuffer>(device_id, buffer_size,
+                                                MemoryType::DEFAULT);
+    } else {
+      gpu_buffer.reset();
+    }
   } else {
     buffer = std::make_shared<ConnBuffer>(device_id, buffer_size,
                                           MemoryType::DEFAULT);
+    gpu_buffer.reset();
   }
 
   comm = new Communicator(buffer, num_channels);
