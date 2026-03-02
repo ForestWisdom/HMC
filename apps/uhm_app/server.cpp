@@ -25,7 +25,7 @@ std::string server_ip;
 std::string client_ip;
 std::string tcp_server_ip;
 
-const size_t buffer_size = 1024ULL * 1024 * 128; // max 32 for MLU
+size_t buffer_size = 1024ULL * 1024 * 128; // max 32 for MLU
 const int device_id = 0;
 const int g_port = 2025;
 const int ctrl_port = 2027;
@@ -236,6 +236,13 @@ int main(int argc, char *argv[]) {
   const bool use_cpu_buffer =
       (mode == "g2h2g" || mode == "ucx" || mode == "write_cpu" ||
        mode == "write_stage");
+
+  const uint32_t default_buf_mb = use_cpu_buffer ? 128 : 32;
+  uint32_t buf_mb = get_env_u32_or_default("BUFFER_SIZE_MB", default_buf_mb);
+  if (buf_mb == 0) buf_mb = default_buf_mb;
+  buffer_size = static_cast<size_t>(buf_mb) * 1024ULL * 1024ULL;
+  std::cout << "ConnBuffer size: " << (buffer_size / 1024 / 1024) << "MB"
+            << std::endl;
 
   if (use_cpu_buffer) {
     buffer = std::make_shared<ConnBuffer>(0, buffer_size, MemoryType::CPU);

@@ -277,6 +277,7 @@ static size_t pipeline_chunk_size = 4 * 1024 * 1024;  // 4MB default
 static size_t pipeline_max_inflight = 64;
 static size_t stage_chunk_size = 8 * 1024 * 1024;
 static size_t stage_slots = 0;
+static size_t stage_src_window = 32 * 1024 * 1024;
 
 void send_channel_slice_pipeline(Context ctx) {
   total_time = 0;
@@ -354,7 +355,7 @@ void send_channel_slice_write_stage(Context ctx) {
   size_t slots = stage_slots == 0 ? slots_by_buf : std::min(stage_slots, slots_by_buf);
   slots = std::max<size_t>(1, slots);
   std::vector<uint64_t> inflight(slots, 0);
-  const size_t src_window = std::max<size_t>(1, std::min(ctx.size, buffer->buffer_size));
+  const size_t src_window = std::max<size_t>(1, std::min(ctx.size, stage_src_window));
 
   auto start = steady_clock_t::now();
   size_t sent = 0;
@@ -458,16 +459,28 @@ int main(int argc, char *argv[]) {
   if (mode == "write_stage") {
     stage_chunk_size = get_env_u32_or_default("STAGE_CHUNK", 8 * 1024 * 1024);
     stage_slots = get_env_u32_or_default("STAGE_SLOTS", 0);
+    uint32_t src_mb = get_env_u32_or_default("STAGE_SRC_WINDOW_MB", 32);
+    if (src_mb == 0) src_mb = 32;
+    stage_src_window = static_cast<size_t>(src_mb) * 1024ULL * 1024ULL;
     std::cout << "WriteStage: stage_chunk=" << (stage_chunk_size / 1024 / 1024)
               << "MB, stage_slots="
               << (stage_slots == 0 ? std::string("auto")
                                    : std::to_string(stage_slots))
+              << ", stage_src_window=" << (stage_src_window / 1024 / 1024)
+              << "MB"
               << std::endl;
   }
 
   const bool use_cpu_buffer =
       (mode == "g2h2g" || mode == "ucx" || mode == "write_cpu" ||
        mode == "write_stage");
+
+  const uint32_t default_buf_mb = use_cpu_buffer ? 128 : 32;
+  uint32_t buf_mb = get_env_u32_or_default("BUFFER_SIZE_MB", default_buf_mb);
+  if (buf_mb == 0) buf_mb = default_buf_mb;
+  buffer_size = static_cast<size_t>(buf_mb) * 1024ULL * 1024ULL;
+  std::cout << "ConnBuffer size: " << (buffer_size / 1024 / 1024) << "MB"
+            << std::endl;
 
   if (use_cpu_buffer) {
     buffer = std::make_shared<ConnBuffer>(0, buffer_size, MemoryType::CPU);
@@ -557,10 +570,12 @@ int main(int argc, char *argv[]) {
 
   for (int power = min_power; power <= max_power; ++power) {
     size_t total_size = (size_t)1 << power;
-    size_t src_size = (mode == "write" || mode == "pipeline" || mode == "write_cpu" ||
-                       mode == "write_stage")
-                          ? std::min(total_size, buffer->buffer_size)
-                          : total_size;
+    size_t src_size = total_size;
+    if (mode == "write_stage") {
+      src_size = std::min(total_size, stage_src_window);
+    } else if (mode == "write" || mode == "pipeline" || mode == "write_cpu") {
+      src_size = std::min(total_size, buffer->buffer_size);
+    }
     std::vector<uint8_t> host_data(src_size, 'A');
 
     void *device_ptr = nullptr;
