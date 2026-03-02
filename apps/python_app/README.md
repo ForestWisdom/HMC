@@ -28,6 +28,26 @@ CUDA_VISIBLE_DEVICES=1 python3 perf_rocm.py --role client --server-ip 192.168.2.
 > - ucx传输gpu数据时，小数据会走put short路径导致报错，建议传输大于4K的数据。 
 > - 如果ucx遇到不通问题，指定网卡：export UCX_NET_DEVICES=mlx5_0:1,mlx5_3:1
 
+# perf_write_bw.py
+one-sided write bandwidth benchmark (reduced control-plane overhead).
+
+```
+# server
+python3 perf_write_bw.py --role server --bind-ip 192.168.2.244 --local-ip 192.168.2.244 --ctrl-bind-ip 192.168.2.244 --rdma-port 2025 --ucx-port 2026 --ctrl-port 20300 --ctrl-tcp-port 2027 --num-chs 4
+
+# client
+python3 perf_write_bw.py --role client --server-ip 192.168.2.244 --local-ip 192.168.2.248 --ctrl-ip 192.168.2.244 --rdma-port 2025 --ucx-port 2026 --ctrl-port 20300 --ctrl-tcp-port 2027 --conn rdma --sizes 1m,4m,16m,64m --iters 400 --warmup 50 --num-chs 4 --chunk-size 4194304 --max-inflight 128
+```
+
+Optional RDMA tuning env vars:
+```
+export HMC_RDMA_CQ_CAPACITY=1024
+export HMC_RDMA_MAX_WR=1024
+export HMC_RDMA_PIPELINE_SIGNAL_INTERVAL=16
+export HMC_RDMA_PIPELINE_INFLIGHT=128
+export HMC_RDMA_PATH_MTU=4096
+```
+
 
 # collective
 CUDA_VISIBLE_DEVICES=5 torchrun --standalone --nproc_per_node=4 collective.py

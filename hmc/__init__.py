@@ -619,33 +619,83 @@ class Session:
 
     def put_nb(self, ip: str, port: int, local_off: int, remote_off: int, nbytes: int, conn: ConnType = ConnType.RDMA) -> int:
         p = _require_port(port)
-        wr_id_box = [0]
-        st = self.comm.putNB(
+        st, wr_id = self.comm.putNB(
             str(ip),
             int(p),
             int(local_off),
             int(remote_off),
             int(nbytes),
-            wr_id_box,
             _to_core_conn_type(conn),
         )
         _ensure_ok(st, "Communicator.putNB failed")
-        return int(wr_id_box[0])
+        return int(wr_id)
 
     def get_nb(self, ip: str, port: int, local_off: int, remote_off: int, nbytes: int, conn: ConnType = ConnType.RDMA) -> int:
         p = _require_port(port)
-        wr_id_box = [0]
-        st = self.comm.getNB(
+        st, wr_id = self.comm.getNB(
             str(ip),
             int(p),
             int(local_off),
             int(remote_off),
             int(nbytes),
-            wr_id_box,
             _to_core_conn_type(conn),
         )
         _ensure_ok(st, "Communicator.getNB failed")
-        return int(wr_id_box[0])
+        return int(wr_id)
+
+    def put_pipeline(
+        self,
+        ip: str,
+        port: int,
+        local_off: int,
+        remote_off: int,
+        nbytes: int,
+        *,
+        chunk_size: int = 0,
+        max_inflight: int = 64,
+        conn: ConnType = ConnType.RDMA,
+    ) -> None:
+        p = _require_port(port)
+        _ensure_ok(
+            self.comm.putPipeline(
+                str(ip),
+                int(p),
+                int(local_off),
+                int(remote_off),
+                int(nbytes),
+                int(chunk_size),
+                int(max_inflight),
+                _to_core_conn_type(conn),
+            ),
+            "Communicator.putPipeline failed",
+        )
+
+    def get_pipeline(
+        self,
+        ip: str,
+        port: int,
+        local_off: int,
+        remote_off: int,
+        nbytes: int,
+        *,
+        chunk_size: int = 0,
+        max_inflight: int = 64,
+        conn: ConnType = ConnType.RDMA,
+    ) -> None:
+        p = _require_port(port)
+        _ensure_ok(
+            self.comm.getPipeline(
+                str(ip),
+                int(p),
+                int(local_off),
+                int(remote_off),
+                int(nbytes),
+                int(chunk_size),
+                int(max_inflight),
+                _to_core_conn_type(conn),
+            ),
+            "Communicator.getPipeline failed",
+        )
 
     def wait(self, wr_id: int | list[int]) -> None:
         if isinstance(wr_id, list):
