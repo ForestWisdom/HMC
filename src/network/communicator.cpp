@@ -335,6 +335,11 @@ status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
                                    int device_id, MemoryType mem_type) {
   auto &ctrl = hmc::CtrlSocketManager::instance();
 
+  if (!buffer->ptr) {
+    logError("connectP2p: ConnBuffer ptr is null");
+    return status_t::ERROR;
+  }
+
   auto transport = P2pTransport::create(mem_type);
   if (!transport) {
     logError("P2pTransport not available for mem_type=%d", (int)mem_type);

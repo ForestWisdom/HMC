@@ -133,6 +133,7 @@ public:
     }
     if (!entry || !entry->endpoint) return status_t::ERROR;
     std::lock_guard<std::mutex> entry_lock(entry->mutex);
+    if (!entry->endpoint) return status_t::ERROR;
     return func(entry->endpoint.get());
   }
 

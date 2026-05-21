@@ -32,11 +32,12 @@ status_t CambriconTransport::exportHandle(void *handle_buf) {
 
 status_t CambriconTransport::importHandle(const void *handle_buf, void *&ptr,
                                           int peer_device) {
+  if (peer_ptr_) { cnrtUnMapMemHandle(peer_ptr_); peer_ptr_ = nullptr; }
   uint64_t handle_val = *reinterpret_cast<const uint64_t *>(handle_buf);
   int flags = (peer_device >= 0 && peer_device != device_) ? 0x2 : 0;
   cnrtRet_t ret = cnrtMapMemHandle(&ptr, reinterpret_cast<cnrtIpcMemHandle>(handle_val), flags);
   if (ret != cnrtSuccess) {
-    logError("CambriconTransport cnrtAcquireMemHandle failed: %d", ret);
+    logError("CambriconTransport cnrtMapMemHandle failed: %d", ret);
     return status_t::ERROR;
   }
   peer_ptr_ = ptr;
