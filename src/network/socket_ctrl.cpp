@@ -235,7 +235,13 @@ bool CtrlSocketManager::connectTcp(CtrlId peer_id, const std::string& ip, uint16
 }
 
 bool CtrlSocketManager::connectUds(CtrlId peer_id, const std::string& uds_path, CtrlId self_id) {
-  int fd = dialUds_(uds_path);
+  // Retry connect because the peer's UDS listener may not be ready yet
+  int fd = -1;
+  for (int retry = 0; retry < 5; retry++) {
+    fd = dialUds_(uds_path);
+    if (fd >= 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
   if (fd < 0) {
     std::cerr << "[CtrlSocketManager] connectUds failed to " << uds_path << "\n";
     return false;
