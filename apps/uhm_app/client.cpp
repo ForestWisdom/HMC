@@ -556,12 +556,12 @@ int main(int argc, char *argv[]) {
                      buffer->mem_ops ? buffer->mem_ops->getMemoryType() : MemoryType::DEFAULT);
     std::cout << "P2P connection established (same-host IPC)" << std::endl;
   } else {
-    // ---- Original RDMA connect ----
+    // ---- Original RDMA/UCX connect ----
     Communicator::CtrlLink ctrl_link;
-    ctrl_link.transport = Communicator::CtrlTransport::UDS;
-    std::string uds_dir = get_env_or_default("CTRL_UDS_DIR", "/tmp");
-    ctrl_link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);
-    std::cout << "Ctrl transport=UDS (same_host) path=" << ctrl_link.uds_path
+    ctrl_link.transport = Communicator::CtrlTransport::TCP;
+    ctrl_link.ip = server_ip;
+    ctrl_link.port = static_cast<uint16_t>(ctrl_port + 1);
+    std::cout << "Ctrl transport=TCP " << ctrl_link.ip << ":" << ctrl_link.port
               << std::endl;
 
     auto r = comm->connectTo(peer_rank, self_rank, server_ip,
