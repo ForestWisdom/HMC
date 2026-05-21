@@ -288,7 +288,7 @@ int main(int argc, char *argv[]) {
     ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
     {
       char msg[8];
-      read(ctrl_socket_fd, msg, sizeof(msg));
+      ssize_t n = read(ctrl_socket_fd, msg, sizeof(msg)); (void)n;
     }
 
     Communicator::CtrlLink link;
