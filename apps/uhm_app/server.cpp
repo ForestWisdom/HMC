@@ -291,7 +291,8 @@ int main(int argc, char *argv[]) {
     // Wait for client via TCP sync
     {
       char msg[8];
-      read(ctrl_socket_fd, msg, sizeof(msg));
+      ssize_t n = read(ctrl_socket_fd, msg, sizeof(msg));
+      (void)n;
     }
 
     comm->connectCtrl(peer_rank, self_rank, link);
