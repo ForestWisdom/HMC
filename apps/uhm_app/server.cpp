@@ -299,7 +299,7 @@ int main(int argc, char *argv[]) {
 
     // Exchange via TCP
     uint64_t peer_handle = 0;
-    write(ctrl_socket_fd, &local_handle, sizeof(local_handle));
+    { ssize_t n = write(ctrl_socket_fd, &local_handle, sizeof(local_handle)); (void)n; }
     size_t recvd = 0;
     while (recvd < sizeof(peer_handle)) {
       ssize_t n = read(ctrl_socket_fd, (char*)&peer_handle + recvd, sizeof(peer_handle) - recvd);

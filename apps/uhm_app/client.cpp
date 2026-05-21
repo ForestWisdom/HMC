@@ -566,7 +566,7 @@ int main(int argc, char *argv[]) {
         recvd += n;
       }
     }
-    write(ctrl_sock, &local_handle, sizeof(local_handle));
+    { ssize_t n = write(ctrl_sock, &local_handle, sizeof(local_handle)); (void)n; }
 
     void *peer_ptr = nullptr;
     t->importHandle(peer_handle, peer_ptr);
