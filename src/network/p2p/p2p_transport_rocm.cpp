@@ -34,6 +34,7 @@ status_t RocmTransport::exportHandle(void *handle_buf) {
 status_t RocmTransport::importHandle(const void *handle_buf, void *&ptr,
                                      int peer_device) {
   if (peer_ptr_) { hipIpcCloseMemHandle(peer_ptr_); peer_ptr_ = nullptr; }
+  peer_device_ = peer_device;
   hipIpcMemHandle_t ipc_handle;
   memcpy(&ipc_handle, handle_buf, sizeof(ipc_handle));
 
@@ -49,10 +50,10 @@ status_t RocmTransport::importHandle(const void *handle_buf, void *&ptr,
 }
 
 status_t RocmTransport::copy(void *dst, void *src, size_t sz) {
-  hipSetDevice(device_);
-  hipError_t err = hipMemcpy(dst, src, sz, hipMemcpyDefault);
+  hipError_t err = hipMemcpy(dst, src, sz, hipMemcpyDeviceToDevice);
   if (err != hipSuccess) {
-    logError("RocmTransport hipMemcpy failed: %d", err);
+    logError("RocmTransport hipMemcpy(D2D) dst=%p src=%p sz=%zu err=%d",
+             dst, src, sz, err);
     return status_t::ERROR;
   }
   err = hipDeviceSynchronize();

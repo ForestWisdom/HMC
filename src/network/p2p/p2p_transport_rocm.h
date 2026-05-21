@@ -24,6 +24,7 @@ public:
 private:
 #ifdef ENABLE_ROCM
   int device_ = -1;
+  int peer_device_ = -1;
   void *buf_ = nullptr;
   void *peer_ptr_ = nullptr;
 #endif
