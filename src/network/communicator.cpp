@@ -360,9 +360,10 @@ status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
   }
   logInfo("P2P local=0x%llx peer=0x%llx", (unsigned long long)local_handle, (unsigned long long)peer_handle);
 
-  // Import peer handle
+  // Import peer handle (guess peer_device from peer_id for cross-device flag)
+  int peer_device = static_cast<int>(peer_id);
   void *peer_ptr = nullptr;
-  st = transport->importHandle(peer_handle, peer_ptr, -1);
+  st = transport->importHandle(peer_handle, peer_ptr, peer_device);
   if (st != status_t::SUCCESS) { logError("importHandle failed"); return st; }
 
   int peer_rank = static_cast<int>(peer_id);
