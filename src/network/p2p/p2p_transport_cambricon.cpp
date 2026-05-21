@@ -31,7 +31,7 @@ status_t CambriconTransport::exportHandle(uint64_t &handle) {
 }
 
 status_t CambriconTransport::importHandle(uint64_t handle, void *&ptr) {
-  cnrtRet_t ret = cnrtMapMemHandle(&ptr, reinterpret_cast<cnrtIpcMemHandle>(handle), 0x2);
+  cnrtRet_t ret = cnrtMapMemHandle(&ptr, reinterpret_cast<cnrtIpcMemHandle>(handle), 0);
   if (ret != cnrtSuccess) {
     logError("CambriconTransport cnrtMapMemHandle failed: %d", ret);
     return status_t::ERROR;
