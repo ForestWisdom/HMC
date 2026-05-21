@@ -38,8 +38,8 @@ Communicator *comm = nullptr;
 std::shared_ptr<ConnBuffer> buffer;
 std::shared_ptr<ConnBuffer> gpu_buffer;
 
-Memory *gpu_mem_op = new Memory(device_id);
-Memory *cpu_mem_op = new Memory(0, MemoryType::CPU);
+Memory *gpu_mem_op = nullptr;
+Memory *cpu_mem_op = nullptr;
 
 struct Context {
   void *cpu_data_ptr;
@@ -477,6 +477,9 @@ int main(int argc, char *argv[]) {
 
   const bool same_host = (server_ip == client_ip);
   if (same_host) device_id = static_cast<int>(self_rank);
+
+  if (!gpu_mem_op) gpu_mem_op = new Memory(device_id);
+  if (!cpu_mem_op) cpu_mem_op = new Memory(0, MemoryType::CPU);
 
   int num_channels = get_env_u32_or_default("NUM_CHANNELS", 1);
   std::cout << "Using " << num_channels << " QPs" << std::endl;
