@@ -358,6 +358,7 @@ status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
     ctrl.recvU64(peer_id, peer_handle);
     ctrl.sendU64(peer_id, local_handle);
   }
+  logInfo("P2P local=0x%llx peer=0x%llx", (unsigned long long)local_handle, (unsigned long long)peer_handle);
 
   // Import peer handle
   void *peer_ptr = nullptr;
@@ -387,6 +388,11 @@ status_t Communicator::getP2p(int peer_rank, size_t local_off,
         if (!ep) return status_t::ERROR;
         return ep->readData(local_off, remote_off, size);
       });
+}
+
+status_t Communicator::addP2pEndpoint(int peer_rank,
+                                       std::unique_ptr<Endpoint> endpoint) {
+  return conn_manager->initiateP2pConnection(peer_rank, std::move(endpoint));
 }
 
 } // namespace hmc

@@ -13,6 +13,10 @@
 
 #include "../src/memories/mem_type.h"
 #include "../src/resource_manager/gpu_interface.h"
+#include "../src/network/p2p/p2p_transport.h"
+#include "../src/network/p2p/p2p_endpoint.h"
+
+#include <cnrt.h>
 
 using namespace hmc;
 using namespace std;
@@ -279,29 +283,44 @@ int main(int argc, char *argv[]) {
   const bool same_host = (server_ip == client_ip);
 
   if (same_host) {
+    // P2P mode: exchange IPC handles via TCP control socket
     std::string uds_dir = get_env_or_default("CTRL_UDS_DIR", "/tmp");
     std::string uds_path = Communicator::udsPathFor(uds_dir, self_rank);
     comm->initCtrlServer(server_ip, 0, uds_path);
 
+    ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
+
+    // Setup P2P transport
+    auto t = P2pTransport::create(buffer->mem_ops ? buffer->mem_ops->getMemoryType() : MemoryType::DEFAULT);
+    if (!t) { std::cerr << "P2P not supported\n"; return -1; }
+    t->init(device_id, buffer->ptr, buffer->buffer_size);
+    uint64_t local_handle;
+    t->exportHandle(local_handle);
+
+    // Exchange via TCP
+    uint64_t peer_handle = 0;
+    write(ctrl_socket_fd, &local_handle, sizeof(local_handle));
+    size_t recvd = 0;
+    while (recvd < sizeof(peer_handle)) {
+      ssize_t n = read(ctrl_socket_fd, (char*)&peer_handle + recvd, sizeof(peer_handle) - recvd);
+      if (n <= 0) break;
+      recvd += n;
+    }
+
+    void *peer_ptr = nullptr;
+    t->importHandle(peer_handle, peer_ptr);
+
+    // Use UDS control for tags if needed
     Communicator::CtrlLink link;
     link.transport = Communicator::CtrlTransport::UDS;
     link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);
-
-    ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
-    // Wait for client via TCP sync
-    {
-      char msg[8];
-      ssize_t n = read(ctrl_socket_fd, msg, sizeof(msg));
-      (void)n;
-    }
-
     comm->connectCtrl(peer_rank, self_rank, link);
-    comm->connectP2p(peer_rank, self_rank, device_id,
-                     buffer->mem_ops ? buffer->mem_ops->getMemoryType() : MemoryType::DEFAULT);
-    std::cout << "P2P connection established (same-host IPC)" << std::endl;
 
-    // For P2P mode, we also need the TCP control socket for old-style sync
-    // but data transfer goes via ConnBuffer
+    // Store as P2P endpoint
+    auto ep = std::make_unique<P2pEndpoint>(std::move(t), buffer->ptr, peer_ptr, peer_rank);
+    comm->addP2pEndpoint(peer_rank, std::move(ep));
+
+    std::cout << "P2P connection established (same-host IPC)" << std::endl;
   } else {
     // ---- Original RDMA init ----
     std::string ctrl_uds_path;

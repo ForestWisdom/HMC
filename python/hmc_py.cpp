@@ -327,6 +327,9 @@ PYBIND11_MODULE(hmc, m) {
            py::arg("peer_id"), py::arg("self_id"),
            py::arg("device_id"), py::arg("mem_type"))
 
+      .def("addP2pEndpoint", &hmc::Communicator::addP2pEndpoint,
+           py::arg("peer_rank"), py::arg("endpoint"))
+
       .def("putP2p", &hmc::Communicator::putP2p,
            py::arg("peer_rank"), py::arg("local_off"),
            py::arg("remote_off"), py::arg("size"))
