@@ -52,8 +52,7 @@ status_t RocmTransport::importHandle(const void *handle_buf, void *&ptr,
 status_t RocmTransport::copy(void *dst, void *src, size_t sz) {
   hipError_t err = hipMemcpy(dst, src, sz, hipMemcpyDeviceToDevice);
   if (err != hipSuccess) {
-    logError("RocmTransport hipMemcpy(D2D) dst=%p src=%p sz=%zu err=%d",
-             dst, src, sz, err);
+    logError("RocmTransport hipMemcpy(D2D) failed: %d", err);
     return status_t::ERROR;
   }
   err = hipDeviceSynchronize();
