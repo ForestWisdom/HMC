@@ -348,18 +348,16 @@ status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
   uint64_t local_handle = 0;
   st = transport->exportHandle(local_handle);
   if (st != status_t::SUCCESS) { logError("exportHandle failed"); return st; }
-  logInfo("P2P local handle: 0x%llx", (unsigned long long)local_handle);
 
-  // Exchange handles via control plane (smaller rank sends first)
+  // Exchange handles via UDS (use sendU64/recvU64 for reliable type)
   uint64_t peer_handle = 0;
   if (self_id < peer_id) {
-    ctrl.sendStruct(peer_id, local_handle);
-    ctrl.recvStruct(peer_id, peer_handle);
+    ctrl.sendU64(peer_id, local_handle);
+    ctrl.recvU64(peer_id, peer_handle);
   } else {
-    ctrl.recvStruct(peer_id, peer_handle);
-    ctrl.sendStruct(peer_id, local_handle);
+    ctrl.recvU64(peer_id, peer_handle);
+    ctrl.sendU64(peer_id, local_handle);
   }
-  logInfo("P2P peer handle: 0x%llx", (unsigned long long)peer_handle);
 
   // Import peer handle
   void *peer_ptr = nullptr;
