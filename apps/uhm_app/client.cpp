@@ -553,7 +553,7 @@ int main(int argc, char *argv[]) {
 
     comm->connectCtrl(peer_rank, self_rank, link);
     comm->connectP2p(peer_rank, self_rank, device_id,
-                     buffer->mem_type == MemoryType::CPU ? MemoryType::DEFAULT : buffer->mem_type);
+                     buffer->mem_ops ? buffer->mem_ops->getMemoryType() : MemoryType::DEFAULT);
     std::cout << "P2P connection established (same-host IPC)" << std::endl;
   } else {
     // ---- Original RDMA connect ----
