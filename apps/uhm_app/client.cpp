@@ -539,6 +539,13 @@ int main(int argc, char *argv[]) {
     std::string uds_path = Communicator::udsPathFor(uds_dir, self_rank);
     comm->initCtrlServer("127.0.0.1", 0, uds_path);
 
+    // Signal server via TCP before UDS connect
+    if (!connect_control_server(tcp_server_ip, ctrl_port)) {
+      std::cerr << "Failed to connect control server" << std::endl;
+      return -1;
+    }
+    send_control_message("START");
+
     Communicator::CtrlLink link;
     link.transport = Communicator::CtrlTransport::UDS;
     link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);

@@ -284,6 +284,13 @@ int main(int argc, char *argv[]) {
     std::string uds_path = Communicator::udsPathFor(uds_dir, self_rank);
     comm->initCtrlServer(server_ip, 0, uds_path);
 
+    // Wait for client via TCP sync before connecting UDS
+    ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
+    {
+      char msg[8];
+      read(ctrl_socket_fd, msg, sizeof(msg));
+    }
+
     Communicator::CtrlLink link;
     link.transport = Communicator::CtrlTransport::UDS;
     link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);
@@ -291,8 +298,6 @@ int main(int argc, char *argv[]) {
 
     comm->connectP2p(peer_rank, self_rank, device_id,
                      buffer->mem_ops ? buffer->mem_ops->getMemoryType() : MemoryType::DEFAULT);
-
-    ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
     std::cout << "P2P connection established (same-host IPC)" << std::endl;
   } else {
     // ---- Original RDMA init ----
