@@ -39,17 +39,6 @@ status_t CambriconTransport::importHandle(const void *handle_buf, void *&ptr,
     logError("CambriconTransport cnrtAcquireMemHandle failed: %d", ret);
     return status_t::ERROR;
   }
-  handle = reinterpret_cast<uint64_t>(ipc_handle);
-  return status_t::SUCCESS;
-}
-
-status_t CambriconTransport::importHandle(uint64_t handle, void *&ptr, int peer_device) {
-  int flags = (peer_device >= 0 && peer_device != device_) ? 0x2 : 0;
-  cnrtRet_t ret = cnrtMapMemHandle(&ptr, reinterpret_cast<cnrtIpcMemHandle>(handle), flags);
-  if (ret != cnrtSuccess) {
-    logError("CambriconTransport cnrtMapMemHandle failed: %d", ret);
-    return status_t::ERROR;
-  }
   peer_ptr_ = ptr;
   return status_t::SUCCESS;
 }
