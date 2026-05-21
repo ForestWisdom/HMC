@@ -32,7 +32,7 @@ std::string client_ip;
 std::string tcp_server_ip;
 
 size_t buffer_size = 1024ULL * 1024 * 128; // max 32 for MLU
-const int device_id = 0;
+int device_id = 0;
 const int g_port = 2025;
 const int ctrl_port = 2027;
 
@@ -479,6 +479,9 @@ int main(int argc, char *argv[]) {
   peer_rank = get_env_u32_or_default("PEER_RANK", 0);
   std::cout << "Ranks: self=" << self_rank << " peer=" << peer_rank << std::endl;
 
+  const bool same_host = (server_ip == client_ip);
+  if (same_host) device_id = static_cast<int>(self_rank);
+
   int num_channels = get_env_u32_or_default("NUM_CHANNELS", 1);
   std::cout << "Using " << num_channels << " QPs" << std::endl;
 
@@ -534,8 +537,6 @@ int main(int argc, char *argv[]) {
 
   ConnType conn_type = (mode == "ucx") ? ConnType::UCX : ConnType::RDMA;
   int port = g_port;
-
-  const bool same_host = (server_ip == client_ip);
 
   if (same_host) {
     // P2P mode: exchange IPC handles via TCP control socket
