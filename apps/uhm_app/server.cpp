@@ -126,11 +126,13 @@ bool wait_for_control_message(int socket_fd) {
 void recv_channel_slice_uhm(Context ctx) {
   size_t flags = 0;
 
-  // NOTE: per your new Communicator, recvDataFrom is still recvDataFrom(ip, ...)
-  // and is intended for RDMA-only cross-IP p2p legacy UHM path;
-  // so we DO NOT add port here.
-  //
-  // 如果client也init了server，那么此处用client的rdma port，否则是0
+  const bool same_host = (server_ip == client_ip);
+  if (same_host) {
+    // P2P mode: data already in ConnBuffer via client's putP2p
+    wait_for_control_message(ctrl_socket_fd);
+    return;
+  }
+
   if (comm->recvDataFrom(client_ip, 0, ctx.gpu_data_ptr, ctx.size,
                          MemoryType::DEFAULT, &flags) != status_t::SUCCESS) {
     std::lock_guard<std::mutex> lock(*ctx.log_mutex);
@@ -271,33 +273,52 @@ int main(int argc, char *argv[]) {
 
   comm = new Communicator(buffer, num_channels);
 
-  ConnType conn_type = (mode == "ucx") ? ConnType::UCX : ConnType::RDMA;
+  ConnType   conn_type = (mode == "ucx") ? ConnType::UCX : ConnType::RDMA;
   int port = g_port;
 
-  // ---- initServer(bind_ip, data_port, ctrl_tcp_port, ctrl_uds_path, serverType) ----
   const bool same_host = (server_ip == client_ip);
-
-  std::string ctrl_uds_path;
-  uint16_t ctrl_tcp_port = static_cast<uint16_t>(ctrl_port + 1);
 
   if (same_host) {
     std::string uds_dir = get_env_or_default("CTRL_UDS_DIR", "/tmp");
-    ctrl_uds_path = Communicator::udsPathFor(uds_dir, self_rank);
-    std::cout << "Ctrl transport=UDS (same_host) listen_path=" << ctrl_uds_path
-              << std::endl;
+    std::string uds_path = Communicator::udsPathFor(uds_dir, self_rank);
+    comm->initCtrlServer(server_ip, 0, uds_path);
+
+    Communicator::CtrlLink link;
+    link.transport = Communicator::CtrlTransport::UDS;
+    link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);
+
+    ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
+    // Wait for client via TCP sync
+    {
+      char msg[8];
+      read(ctrl_socket_fd, msg, sizeof(msg));
+    }
+
+    comm->connectCtrl(peer_rank, self_rank, link);
+    comm->connectP2p(peer_rank, self_rank, device_id,
+                     buffer->mem_type == MemoryType::CPU ? MemoryType::DEFAULT : buffer->mem_type);
+    std::cout << "P2P connection established (same-host IPC)" << std::endl;
+
+    // For P2P mode, we also need the TCP control socket for old-style sync
+    // but data transfer goes via ConnBuffer
   } else {
-    ctrl_uds_path = "";
+    // ---- Original RDMA init ----
+    std::string ctrl_uds_path;
+    uint16_t ctrl_tcp_port = static_cast<uint16_t>(ctrl_port + 1);
+
+    std::string uds_dir = get_env_or_default("CTRL_UDS_DIR", "/tmp");
+    ctrl_uds_path = Communicator::udsPathFor(uds_dir, self_rank);
     std::cout << "Ctrl transport=TCP listen " << server_ip << ":"
               << ctrl_tcp_port << std::endl;
-  }
 
-  if (comm->initServer(server_ip, static_cast<uint16_t>(port), ctrl_tcp_port,
-                       ctrl_uds_path, conn_type) != status_t::SUCCESS) {
-    std::cerr << "Failed to init server." << std::endl;
-    return -1;
-  }
+    if (comm->initServer(server_ip, static_cast<uint16_t>(port), ctrl_tcp_port,
+                         ctrl_uds_path, conn_type) != status_t::SUCCESS) {
+      std::cerr << "Failed to init server." << std::endl;
+      return -1;
+    }
 
-  ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
+    ctrl_socket_fd = setup_tcp_control_socket(ctrl_port, tcp_server_ip);
+  }
 
   void (*recv_func)(Context) = nullptr;
   if (mode == "serial")
@@ -326,7 +347,7 @@ int main(int argc, char *argv[]) {
     size_t total_size = size_t(1) << power;
     const bool verify_from_buffer =
         (mode == "g2h2g" || mode == "pipeline" || mode == "write" ||
-         mode == "write_cpu" || mode == "write_stage");
+         mode == "write_cpu" || mode == "write_stage") || same_host;
     const size_t buffer_window =
         (buffer && buffer->buffer_size > 0) ? buffer->buffer_size : buffer_size;
     size_t check_size = verify_from_buffer ? std::min(total_size, buffer_window)

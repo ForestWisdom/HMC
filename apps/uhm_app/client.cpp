@@ -124,6 +124,21 @@ void close_control_connection() {
 
 void send_channel_slice_uhm(Context ctx) {
   total_time = 0;
+
+  const bool same_host = (server_ip == client_ip);
+  if (same_host) {
+    // P2P mode: write GPU data to ConnBuffer, then putP2p to server's ConnBuffer
+    auto start = steady_clock_t::now();
+
+    buffer->writeFromGpu(ctx.gpu_data_ptr, ctx.size, 0);
+    comm->putP2p(peer_rank, 0, 0, ctx.size);
+
+    auto end = steady_clock_t::now();
+    total_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    send_control_message("Finished");
+    return;
+  }
+
   auto start = steady_clock_t::now();
 
   auto status =
@@ -516,45 +531,57 @@ int main(int argc, char *argv[]) {
   ConnType conn_type = (mode == "ucx") ? ConnType::UCX : ConnType::RDMA;
   int port = g_port;
 
-  // ---- ctrl link: same-host => UDS, cross-host => TCP ----
-  Communicator::CtrlLink ctrl_link;
   const bool same_host = (server_ip == client_ip);
 
   if (same_host) {
+    // P2P mode
+    std::string uds_dir = get_env_or_default("CTRL_UDS_DIR", "/tmp");
+    std::string uds_path = Communicator::udsPathFor(uds_dir, self_rank);
+    comm->initCtrlServer("127.0.0.1", 0, uds_path);
+
+    // Connect TCP control first to signal server
+    if (!connect_control_server(tcp_server_ip, ctrl_port)) {
+      std::cerr << "Failed to connect control server" << std::endl;
+      return -1;
+    }
+    send_control_message("START");
+
+    Communicator::CtrlLink link;
+    link.transport = Communicator::CtrlTransport::UDS;
+    link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    comm->connectCtrl(peer_rank, self_rank, link);
+    comm->connectP2p(peer_rank, self_rank, device_id,
+                     buffer->mem_type == MemoryType::CPU ? MemoryType::DEFAULT : buffer->mem_type);
+    std::cout << "P2P connection established (same-host IPC)" << std::endl;
+  } else {
+    // ---- Original RDMA connect ----
+    Communicator::CtrlLink ctrl_link;
     ctrl_link.transport = Communicator::CtrlTransport::UDS;
     std::string uds_dir = get_env_or_default("CTRL_UDS_DIR", "/tmp");
-    ctrl_link.uds_path =
-        Communicator::udsPathFor(uds_dir, peer_rank); // server rank path
+    ctrl_link.uds_path = Communicator::udsPathFor(uds_dir, peer_rank);
     std::cout << "Ctrl transport=UDS (same_host) path=" << ctrl_link.uds_path
               << std::endl;
-  } else {
-    ctrl_link.transport = Communicator::CtrlTransport::TCP;
-    ctrl_link.ip = server_ip;
-    ctrl_link.port = static_cast<uint16_t>(ctrl_port + 1);
-    std::cout << "Ctrl transport=TCP " << ctrl_link.ip << ":" << ctrl_link.port
-              << std::endl;
-  }
 
-  {
     auto r = comm->connectTo(peer_rank, self_rank, server_ip,
                              static_cast<uint16_t>(port), ctrl_link, conn_type);
     if (r != status_t::SUCCESS) {
       std::cerr << "HMC connectTo failed" << std::endl;
       return -1;
     }
-  }
-
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-
-  int retry_count = 0;
-  while (!connect_control_server(tcp_server_ip, ctrl_port)) {
-    if (retry_count > 5) {
-      std::cerr << "Failed to connect control server :" << tcp_server_ip
-                << std::endl;
-      return -1;
-    }
-    retry_count++;
     std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    int retry_count = 0;
+    while (!connect_control_server(tcp_server_ip, ctrl_port)) {
+      if (retry_count > 5) {
+        std::cerr << "Failed to connect control server :" << tcp_server_ip
+                  << std::endl;
+        return -1;
+      }
+      retry_count++;
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
   }
 
   void (*send_func)(Context) = nullptr;

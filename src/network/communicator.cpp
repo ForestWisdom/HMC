@@ -3,6 +3,8 @@
  */
 #include "./net.h"
 #include "./net_rdma.h"
+#include "./p2p/p2p_transport.h"
+#include "./p2p/p2p_endpoint.h"
 #include <hmc.h>
 
 namespace hmc {
@@ -326,6 +328,64 @@ status_t Communicator::checkConn(const std::string &ip, uint16_t port, ConnType 
         if (ep) return status_t::SUCCESS;
         logDebug("[Communicator] did not have connection to %s:%u", ip.c_str(), (unsigned)port);
         return status_t::ERROR;
+      });
+}
+
+status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
+                                   int device_id, MemoryType mem_type) {
+  auto &ctrl = hmc::CtrlSocketManager::instance();
+
+  auto transport = P2pTransport::create(mem_type);
+  if (!transport) {
+    logError("P2pTransport not available for mem_type=%d", (int)mem_type);
+    return status_t::UNSUPPORT;
+  }
+
+  status_t st = transport->init(device_id, buffer->ptr, buffer->buffer_size);
+  if (st != status_t::SUCCESS) { logError("P2pTransport init failed"); return st; }
+
+  // Export local handle
+  uint64_t local_handle = 0;
+  st = transport->exportHandle(local_handle);
+  if (st != status_t::SUCCESS) { logError("exportHandle failed"); return st; }
+
+  // Exchange handles via control plane (smaller rank sends first)
+  uint64_t peer_handle = 0;
+  if (self_id < peer_id) {
+    ctrl.sendStruct(peer_id, local_handle);
+    ctrl.recvStruct(peer_id, peer_handle);
+  } else {
+    ctrl.recvStruct(peer_id, peer_handle);
+    ctrl.sendStruct(peer_id, local_handle);
+  }
+
+  // Import peer handle
+  void *peer_ptr = nullptr;
+  st = transport->importHandle(peer_handle, peer_ptr);
+  if (st != status_t::SUCCESS) { logError("importHandle failed"); return st; }
+
+  int peer_rank = static_cast<int>(peer_id);
+
+  auto ep = std::make_unique<P2pEndpoint>(std::move(transport), buffer->ptr,
+                                          peer_ptr, peer_rank);
+  return conn_manager->initiateP2pConnection(peer_rank, std::move(ep));
+}
+
+status_t Communicator::putP2p(int peer_rank, size_t local_off,
+                               size_t remote_off, size_t size) {
+  return conn_manager->withP2pEndpoint(peer_rank,
+      [local_off, remote_off, size](Endpoint *ep) -> status_t {
+        if (!ep) return status_t::ERROR;
+        return ep->writeData(local_off, remote_off, size);
+      });
+}
+
+status_t Communicator::getP2p(int peer_rank, size_t local_off,
+                               size_t remote_off, size_t size) {
+  return conn_manager->withP2pEndpoint(peer_rank,
+      [local_off, remote_off, size](Endpoint *ep) -> status_t {
+        if (!ep) return status_t::ERROR;
+        return ep->readData(local_off, remote_off, size);
       });
 }
 

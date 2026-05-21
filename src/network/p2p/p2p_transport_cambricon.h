@@ -1,0 +1,33 @@
+#ifndef HMC_P2P_TRANSPORT_CAMBRICON_H
+#define HMC_P2P_TRANSPORT_CAMBRICON_H
+
+#include "p2p_transport.h"
+
+#ifdef ENABLE_NEUWARE
+#include <cnrt.h>
+#endif
+
+namespace hmc {
+
+class CambriconTransport : public P2pTransport {
+public:
+  CambriconTransport() = default;
+  ~CambriconTransport() override;
+
+  status_t init(int device, void *buf, size_t size) override;
+  status_t exportHandle(uint64_t &handle) override;
+  status_t importHandle(uint64_t handle, void *&ptr) override;
+  status_t copy(void *dst, void *src, size_t sz) override;
+  status_t destroy() override;
+
+private:
+#ifdef ENABLE_NEUWARE
+  int device_ = -1;
+  void *buf_ = nullptr;
+  void *peer_ptr_ = nullptr;
+#endif
+};
+
+} // namespace hmc
+
+#endif
