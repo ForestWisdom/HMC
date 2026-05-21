@@ -345,22 +345,21 @@ status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
   if (st != status_t::SUCCESS) { logError("P2pTransport init failed"); return st; }
 
   // Export local handle
-  uint64_t local_handle = 0;
+  uint8_t local_handle[P2P_HANDLE_SIZE] = {};
   st = transport->exportHandle(local_handle);
   if (st != status_t::SUCCESS) { logError("exportHandle failed"); return st; }
 
-  // Exchange handles via UDS (use sendU64/recvU64 for reliable type)
-  uint64_t peer_handle = 0;
+  // Exchange handles via UDS
+  uint8_t peer_handle[P2P_HANDLE_SIZE] = {};
   if (self_id < peer_id) {
-    ctrl.sendU64(peer_id, local_handle);
-    ctrl.recvU64(peer_id, peer_handle);
+    ctrl.sendStruct(peer_id, local_handle);
+    ctrl.recvStruct(peer_id, peer_handle);
   } else {
-    ctrl.recvU64(peer_id, peer_handle);
-    ctrl.sendU64(peer_id, local_handle);
+    ctrl.recvStruct(peer_id, peer_handle);
+    ctrl.sendStruct(peer_id, local_handle);
   }
-  logInfo("P2P local=0x%llx peer=0x%llx", (unsigned long long)local_handle, (unsigned long long)peer_handle);
 
-  // Import peer handle (guess peer_device from peer_id for cross-device flag)
+  // Import peer handle (guess peer_device from peer_id)
   int peer_device = static_cast<int>(peer_id);
   void *peer_ptr = nullptr;
   st = transport->importHandle(peer_handle, peer_ptr, peer_device);
