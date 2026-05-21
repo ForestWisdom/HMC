@@ -1,6 +1,6 @@
 #include "p2p_transport_cambricon.h"
 
-#include "../utils/log.h"
+#include "utils/log.h"
 
 namespace hmc {
 
