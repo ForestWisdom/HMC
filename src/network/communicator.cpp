@@ -362,7 +362,7 @@ status_t Communicator::connectP2p(CtrlId peer_id, CtrlId self_id,
 
   // Import peer handle
   void *peer_ptr = nullptr;
-  st = transport->importHandle(peer_handle, peer_ptr);
+  st = transport->importHandle(peer_handle, peer_ptr, -1);
   if (st != status_t::SUCCESS) { logError("importHandle failed"); return st; }
 
   int peer_rank = static_cast<int>(peer_id);

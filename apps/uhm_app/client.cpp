@@ -570,7 +570,7 @@ int main(int argc, char *argv[]) {
     { ssize_t n = write(ctrl_sock, &local_handle, sizeof(local_handle)); (void)n; }
 
     void *peer_ptr = nullptr;
-    t->importHandle(peer_handle, peer_ptr);
+    t->importHandle(peer_handle, peer_ptr, static_cast<int>(peer_rank));
 
     // UDS control
     Communicator::CtrlLink link;

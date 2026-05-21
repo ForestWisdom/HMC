@@ -309,7 +309,7 @@ int main(int argc, char *argv[]) {
     }
 
     void *peer_ptr = nullptr;
-    t->importHandle(peer_handle, peer_ptr);
+    t->importHandle(peer_handle, peer_ptr, static_cast<int>(peer_rank));
 
     // Use UDS control for tags if needed
     Communicator::CtrlLink link;

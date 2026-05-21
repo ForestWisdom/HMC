@@ -16,7 +16,7 @@ public:
 
   status_t init(int device, void *buf, size_t size) override;
   status_t exportHandle(uint64_t &handle) override;
-  status_t importHandle(uint64_t handle, void *&ptr) override;
+  status_t importHandle(uint64_t handle, void *&ptr, int peer_device = -1) override;
   status_t copy(void *dst, void *src, size_t sz) override;
   status_t destroy() override;
 

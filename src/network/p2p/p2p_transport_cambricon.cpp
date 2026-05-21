@@ -30,8 +30,9 @@ status_t CambriconTransport::exportHandle(uint64_t &handle) {
   return status_t::SUCCESS;
 }
 
-status_t CambriconTransport::importHandle(uint64_t handle, void *&ptr) {
-  cnrtRet_t ret = cnrtMapMemHandle(&ptr, reinterpret_cast<cnrtIpcMemHandle>(handle), 0x2);
+status_t CambriconTransport::importHandle(uint64_t handle, void *&ptr, int peer_device) {
+  int flags = (peer_device >= 0 && peer_device != device_) ? 0x2 : 0;
+  cnrtRet_t ret = cnrtMapMemHandle(&ptr, reinterpret_cast<cnrtIpcMemHandle>(handle), flags);
   if (ret != cnrtSuccess) {
     logError("CambriconTransport cnrtMapMemHandle failed: %d", ret);
     return status_t::ERROR;
@@ -69,7 +70,7 @@ status_t CambriconTransport::init(int, void *, size_t) {
 status_t CambriconTransport::exportHandle(uint64_t &) {
   return status_t::UNSUPPORT;
 }
-status_t CambriconTransport::importHandle(uint64_t, void *&) {
+status_t CambriconTransport::importHandle(uint64_t, void *&, int) {
   return status_t::UNSUPPORT;
 }
 status_t CambriconTransport::copy(void *, void *, size_t) {
