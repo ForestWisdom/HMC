@@ -49,6 +49,7 @@ status_t RocmTransport::importHandle(const void *handle_buf, void *&ptr,
 }
 
 status_t RocmTransport::copy(void *dst, void *src, size_t sz) {
+  hipSetDevice(device_);
   hipError_t err = hipMemcpy(dst, src, sz, hipMemcpyDefault);
   if (err != hipSuccess) {
     logError("RocmTransport hipMemcpy failed: %d", err);
